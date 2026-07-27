@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>localsync — vanilla JS notes (no framework)</title>
+    <style>
+        :root {
+            color-scheme: light dark;
+            --bg: #f5f6fa;
+            --surface: #ffffff;
+            --surface-2: #f8f9fc;
+            --border: #e2e4ec;
+            --text: #1c1f2a;
+            --text-muted: #6b7280;
+            --primary: #4f46e5;
+            --primary-hover: #4338ca;
+            --primary-contrast: #ffffff;
+            --accent-a: #2563eb;
+            --accent-b: #7c3aed;
+            --success: #15803d;
+            --success-bg: #e8f7ee;
+            --warning: #92610a;
+            --warning-bg: #fdf3e0;
+            --danger: #b91c1c;
+            --danger-bg: #fdecea;
+            --danger-soft: rgba(185, 28, 28, 0.1);
+            --radius: 0.65rem;
+            --shadow: 0 1px 2px rgba(20, 20, 40, 0.04), 0 6px 16px rgba(20, 20, 40, 0.05);
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #14151b;
+                --surface: #1b1d25;
+                --surface-2: #21232d;
+                --border: #2d303c;
+                --text: #e7e8ee;
+                --text-muted: #9aa0ac;
+                --primary: #818cf8;
+                --primary-hover: #a5b4fc;
+                --primary-contrast: #14151b;
+                --accent-a: #60a5fa;
+                --accent-b: #c084fc;
+                --success: #4ade80;
+                --success-bg: #12261a;
+                --warning: #fbbf24;
+                --warning-bg: #2b2109;
+                --danger: #f87171;
+                --danger-bg: #2c1616;
+                --danger-soft: rgba(248, 113, 113, 0.14);
+                --shadow: 0 1px 2px rgba(0, 0, 0, 0.2), 0 6px 20px rgba(0, 0, 0, 0.3);
+            }
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            font: 16px/1.55 -apple-system, "Segoe UI", system-ui, sans-serif;
+            max-width: 68rem;
+            margin: 2rem auto 4rem;
+            padding: 0 1.25rem;
+            background: var(--bg);
+            color: var(--text);
+        }
+
+        header {
+            margin-bottom: 1.5rem;
+        }
+
+        h1 {
+            margin: 0 0 0.4rem;
+            font-size: 1.65rem;
+            letter-spacing: -0.01em;
+            background: linear-gradient(90deg, var(--accent-a), var(--accent-b));
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+        }
+
+        header p {
+            margin: 0;
+            max-width: 46rem;
+            color: var(--text-muted);
+        }
+
+        h2 {
+            margin: 0;
+            font-size: 1.05rem;
+            letter-spacing: -0.01em;
+        }
+
+        .pill {
+            font-size: 0.78rem;
+            font-weight: 600;
+            padding: 0.15rem 0.6rem;
+            border-radius: 1rem;
+            background: var(--surface-2);
+            border: 1px solid var(--border);
+            color: var(--text-muted);
+            white-space: nowrap;
+        }
+
+        .pill.online {
+            background: var(--success-bg);
+            border-color: transparent;
+            color: var(--success);
+        }
+
+        .pill.offline {
+            background: var(--danger-bg);
+            border-color: transparent;
+            color: var(--danger);
+        }
+
+        .scenario-controls {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.75rem 2rem;
+            align-items: center;
+            padding: 0.85rem 1.1rem;
+            margin-bottom: 1.5rem;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+            font-size: 0.85rem;
+        }
+
+        .scenario-controls label {
+            display: flex;
+            gap: 0.5rem;
+            align-items: center;
+            color: var(--text-muted);
+            font-weight: 500;
+        }
+
+        .clients {
+            display: flex;
+            gap: 1.5rem;
+            align-items: flex-start;
+        }
+
+        .client {
+            flex: 1;
+            min-width: 0;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-top: 3px solid var(--accent-a);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+            padding: 1.1rem 1.25rem 1.25rem;
+        }
+
+        #client-b {
+            border-top-color: var(--accent-b);
+        }
+
+        .client-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+            padding-bottom: 0.75rem;
+            margin-bottom: 0.75rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .net-row {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            white-space: nowrap;
+        }
+
+        .row {
+            display: flex;
+            gap: 0.5rem;
+            margin: 0.85rem 0;
+            flex-wrap: wrap;
+        }
+
+        input,
+        textarea,
+        select {
+            flex: 1;
+            padding: 0.5rem 0.65rem;
+            font: inherit;
+            color: var(--text);
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 0.5rem;
+        }
+
+        .scenario-controls select {
+            width: 300px;
+        }
+
+        input:focus-visible,
+        textarea:focus-visible,
+        select:focus-visible,
+        button:focus-visible {
+            outline: 2px solid var(--primary);
+            outline-offset: 1px;
+        }
+
+        button {
+            padding: 0.45rem 0.85rem;
+            font: inherit;
+            font-weight: 500;
+            font-size: 0.9rem;
+            color: var(--text);
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 0.5rem;
+            cursor: pointer;
+            transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+        }
+
+        button:hover {
+            border-color: var(--primary);
+            color: var(--primary);
+        }
+
+        button:active {
+            transform: translateY(1px);
+        }
+
+        .add-btn,
+        .save-btn {
+            background: var(--primary);
+            border-color: var(--primary);
+            color: var(--primary-contrast);
+        }
+
+        .add-btn:hover,
+        .save-btn:hover {
+            background: var(--primary-hover);
+            border-color: var(--primary-hover);
+            color: var(--primary-contrast);
+        }
+
+        .delete-btn {
+            border-color: transparent;
+            background: transparent;
+            color: var(--text-muted);
+            padding: 0.3rem 0.55rem;
+        }
+
+        .delete-btn:hover {
+            color: var(--danger);
+            background: var(--danger-soft);
+            border-color: transparent;
+        }
+
+        .retry-btn {
+            border-color: var(--danger);
+            color: var(--danger);
+        }
+
+        .retry-btn:hover {
+            background: var(--danger);
+            color: var(--primary-contrast);
+        }
+
+        ul.notes-list {
+            list-style: none;
+            padding: 0;
+            margin: 0.5rem 0 0;
+        }
+
+        .notes-list li {
+            padding: 0.55rem 0.15rem;
+            border-bottom: 1px solid var(--border);
+            border-radius: 0.35rem;
+            transition: background-color 0.12s ease;
+        }
+
+        .notes-list li:hover {
+            background: var(--surface-2);
+        }
+
+        .notes-list li:last-child {
+            border-bottom: none;
+        }
+
+        .notes-list li.editing {
+            background: var(--warning-bg);
+        }
+
+        .note-view {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .note-text {
+            word-break: break-word;
+        }
+
+        .unsynced {
+            display: inline-block;
+            margin-left: 0.5rem;
+            padding: 0.05rem 0.5rem;
+            font-size: 0.72rem;
+            font-weight: 600;
+            color: var(--warning);
+            background: var(--warning-bg);
+            border-radius: 1rem;
+            vertical-align: middle;
+        }
+
+        .edit-form {
+            margin-top: 0.6rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.45rem;
+        }
+
+        .conflict-hint {
+            margin: 0;
+            font-size: 0.85rem;
+            color: var(--warning);
+        }
+
+        .validation-error {
+            margin: 0;
+            font-size: 0.85rem;
+            color: var(--danger);
+        }
+
+        .status-row {
+            display: flex;
+            gap: 0.75rem;
+            align-items: center;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            min-height: 1.4em;
+        }
+
+        .error-banner {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 0.75rem;
+            margin: 0.5rem 0;
+            padding: 0.5rem 0.75rem;
+            border-radius: 0.5rem;
+            background: var(--danger-bg);
+            color: var(--danger);
+            font-size: 0.85rem;
+        }
+
+        .loading {
+            color: var(--text-muted);
+            font-style: italic;
+        }
+
+        .manual-controls-hint {
+            margin: 0.25rem 0 0.5rem;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+
+        /* .edit-form and .error-banner set their own `display` above, which -- being an
+           author-stylesheet rule -- otherwise beats the browser's built-in
+           `[hidden] { display: none }` UA rule at equal specificity. These overrides make
+           toggling the `hidden` property from JS win, without reaching for !important. */
+        .edit-form[hidden],
+        .error-banner[hidden] {
+            display: none;
+        }
+    </style>
+
+    <!-- The ONLY wiring needed: map the bare specifier to the built core ESM. -->
+    <!-- No bundler. The browser loads @localsync straight from dist. -->
+    <script type="importmap">
+      {
+        "imports": {
+          "@localsync": "../../dist/index.js"
+        }
+      }
+    </script>
+</head>
+
+<body>
+    <header>
+        <h1>Notes — a local-first recipe</h1>
+        <p>
+            Two independent client panels below share one simulated backend, so you can see
+            real multi-user sync: persistence, offline queueing, validation, conflicting
+            edits, and error/retry handling.
+        </p>
+    </header>
+
+    <section class="scenario-controls">
+        <label>Merge strategy
+            <select id="merge-select">
+                <option value="custom">custom — combine both edits (default)</option>
+                <option value="lastWriteWins">lastWriteWins</option>
+                <option value="serverWins">serverWins</option>
+            </select>
+        </label>
+        <label>Keep pending on pull
+            <select id="keep-pending-select">
+                <option value="true">true — default: your edit stays optimistic until pushed, safe
+                    for any merge strategy</option>
+                <option value="false">false — edge case: merge runs immediately on pull instead of
+                    waiting for your push (see README on why this needs a merge-strategy that's
+                    safe to invoke early)</option>
+            </select>
+        </label>
+        <label><input type="checkbox" id="server-error-toggle" /> Simulate server errors</label>
+    </section>
+
+    <template id="client-template">
+        <div class="client-header">
+            <h2 class="panel-title">Client</h2>
+            <span class="net-row">net: <span class="net pill">?</span>
+                <button type="button" class="online-toggle">Toggle online/offline</button>
+            </span>
+        </div>
+        <p class="loading">Loading…</p>
+        <div class="client-body" hidden>
+            <div class="row">
+                <input class="note-input" placeholder="Write a note…" autocomplete="off" />
+                <button type="button" class="add-btn">Add</button>
+            </div>
+            <p class="validation-error top-level-error" hidden></p>
+
+            <label><input type="checkbox" class="autosync-toggle" checked /> Auto-sync (push on
+                change + poll every 4s) — the default</label>
+            <p class="manual-controls-hint">Manual controls below are for instrumenting edge
+                cases (e.g. the conflict walkthrough) — turn Auto-sync off first to use them
+                deliberately.</p>
+            <div class="row">
+                <button type="button" class="push-btn">Push</button>
+                <button type="button" class="pull-btn">Pull</button>
+                <button type="button" class="sync-btn">Sync (push + pull)</button>
+                <button type="button" class="pause-btn">Pause live updates</button>
+            </div>
+
+            <div class="status-row">
+                <span class="status-phase">idle</span>
+                <span class="pending-badge pill">0 pending</span>
+            </div>
+            <div class="error-banner" hidden>
+                <span class="error-message"></span>
+                <button type="button" class="retry-btn">Retry</button>
+            </div>
+
+            <ul class="notes-list"></ul>
+        </div>
+    </template>
+
+    <div class="clients">
+        <section class="client" id="client-a"></section>
+        <section class="client" id="client-b"></section>
+    </div>
+
+    <script type="module" src="./main.js"></script>
+</body>
+
+</html>

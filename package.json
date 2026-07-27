@@ -1,0 +1,38 @@
+{
+	"name": "@localsync",
+	"version": "0.0.0",
+	"description": "Local-first reactive data-sync library.",
+	"type": "module",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"files": [
+		"dist"
+	],
+	"sideEffects": false,
+	"scripts": {
+		"build": "tsc -p tsconfig.json",
+		"typecheck": "tsc -p tsconfig.json --noEmit",
+		"clean": "node -e \"require('fs').rmSync('./dist', { recursive: true, force: true })\"",
+		"lint": "npx @biomejs/biome check --write",
+		"lint-unsafe": "npx @biomejs/biome check --write --unsafe",
+		"test": "tsx --test test/unit/**/*.test.ts",
+		"test:watch": "tsx --test --watch test/unit/**/*.test.ts",
+		"pretest:e2e": "npm run build",
+		"test:e2e": "playwright test",
+		"test:all": "npm run test && npm run test:e2e"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.5.5",
+		"@playwright/test": "^1.49.0",
+		"@types/node": "^24.13.3",
+		"tsx": "^4.23.1",
+		"typescript": "^6.0.3"
+	},
+	"allowScripts": {
+		"esbuild@0.28.1": true
+	}
+}

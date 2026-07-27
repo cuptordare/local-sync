@@ -1,0 +1,9 @@
+{
+	"name": "vanilla-js-notes-app",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"start": "npx --yes serve ../.. --config ./examples/vanilla-js-notes-app/serve.json"
+	}
+}
