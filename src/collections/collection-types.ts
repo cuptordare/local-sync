@@ -1,5 +1,6 @@
 import type { HybridClock, Stamp } from "../crdt/hlc.js";
 import type { Entries, Entry } from "../crdt/lww-map.js";
+import type { MergeFunction } from "../crdt/merge-values.js";
 import type { Listener, Unsubscribe } from "../events/event-types.js";
 import type { ReactiveQuery } from "../reactivity/reactive-query.js";
 import type { RecordEnvelope } from "../records/record-envelope.js";
@@ -114,6 +115,15 @@ export interface CreateCollectionOptions<T extends object> {
 	clock?: HybridClock;
 	/** The id this tab writes as (see device-id.ts). Defaults to one loaded from `storage`. */
 	writerId?: () => Promise<string>;
+	/**
+	 * How to combine an unsaved edit here with an edit someone else saved meanwhile (both made
+	 * from `base`). The result is saved as a new write. Default: `mergeValues` (objects
+	 * field by field, lists as sets or by `id`; the later edit wins where both changed the
+	 * same thing). Not called when either side is a delete.
+	 */
+	merge?: MergeFunction<T>;
+	/** Called after such a merge, e.g. to tell the user their edit was combined with another. */
+	onMerge?: (merge: { key: string; mine: T; theirs: T; result: T }) => void;
 	/** Import records an older version of the library stored (if any). Default true. */
 	importLegacy?: boolean;
 	/** Called with background errors. Defaults to `console.error`. */

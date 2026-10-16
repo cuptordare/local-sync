@@ -26,7 +26,13 @@
 import type { HybridClock } from "../crdt/hlc.js";
 import { createHybridClock, stampTime } from "../crdt/hlc.js";
 import type { Entry, Mark } from "../crdt/lww-map.js";
-import { compareMarks, laterMark, newerEntry } from "../crdt/lww-map.js";
+import {
+	compareEntries,
+	compareMarks,
+	laterMark,
+	newerEntry,
+} from "../crdt/lww-map.js";
+import { mergeValues } from "../crdt/merge-values.js";
 import type { Listener, Unsubscribe } from "../events/event-types.js";
 import { fromLegacyRecords } from "../migration/legacy.js";
 import { createReactiveCache } from "../reactivity/reactive-cache.js";
@@ -55,7 +61,13 @@ import type {
 interface Incoming<T> {
 	entry?: Entry<T>;
 	synced?: Mark;
+	/** The entry `entry` was edited from (for an unsaved local edit). */
+	base?: Entry<T>;
 }
+
+/** Whether two writer ids are tabs of one device (see device-id.ts). */
+const sameDevice = (a: string, b: string): boolean =>
+	a.split(".")[0] === b.split(".")[0];
 
 export function createCollection<T extends object>(
 	options: CreateCollectionOptions<T>,
@@ -65,10 +77,16 @@ export function createCollection<T extends object>(
 	const clock: HybridClock = options.clock ?? createHybridClock();
 	const handleError = options.onError ?? logBackgroundError;
 	const writerId = options.writerId ?? (() => loadWriterId(storage));
+	const mergeEdits = options.merge ?? mergeValues;
 
 	const entries = new Map<string, Entry<T>>();
 	/** Per key, the newest write the remote is known to hold. */
 	const synced = new Map<string, Mark>();
+	/**
+	 * Per key with an unsaved edit: the entry that edit started from, so an edit someone else
+	 * saved meanwhile can be merged with it (see `mergeRemote`).
+	 */
+	const bases = new Map<string, Entry<T>>();
 	/** Keys changed in memory that still need writing to storage. */
 	const unsaved = new Set<string>();
 	/** The envelope each entry is read as; null if its value failed the validator. */
@@ -177,10 +195,12 @@ export function createCollection<T extends object>(
 			const entry = entries.get(key);
 			if (entry === undefined) continue; // removed meanwhile
 			const mark = synced.get(key);
-			changes.set(
-				key,
-				mark === undefined ? { entry } : { entry, synced: mark },
-			);
+			const base = bases.get(key);
+			changes.set(key, {
+				entry,
+				...(mark !== undefined ? { synced: mark } : {}),
+				...(base !== undefined ? { base } : {}),
+			});
 		}
 		try {
 			await storage.merge(name, changes);
@@ -206,7 +226,7 @@ export function createCollection<T extends object>(
 		persist: boolean,
 	): void => {
 		const changed: string[] = [];
-		for (const [key, { entry, synced: mark }] of incoming) {
+		for (const [key, { entry, synced: mark, base }] of incoming) {
 			let didChange = false;
 			if (entry !== undefined) {
 				clock.receive(entry.stamp);
@@ -214,6 +234,17 @@ export function createCollection<T extends object>(
 				const winner = newerEntry(current, entry) as Entry<T>;
 				if (winner !== current) {
 					entries.set(key, deepFreeze(winner));
+					// The base belongs to its edit.
+					if (base === undefined) bases.delete(key);
+					else bases.set(key, deepFreeze(base));
+					didChange = true;
+				} else if (
+					base !== undefined &&
+					compareEntries(entry, current) === 0 &&
+					laterMark(bases.get(key), base) === base &&
+					bases.get(key) !== base
+				) {
+					bases.set(key, deepFreeze(base)); // the same edit, rebased further
 					didChange = true;
 				}
 			}
@@ -234,10 +265,22 @@ export function createCollection<T extends object>(
 		notify(changed);
 	};
 
-	/** Write values (null = delete) as new entries from this tab. */
-	const commit = (values: ReadonlyMap<string, T | null>): void => {
+	/**
+	 * Write values (null = delete) as new entries from this tab. Each edit's base is the entry
+	 * it replaces -- or, if that is itself an unsaved edit, that edit's base -- unless given.
+	 */
+	const commit = (
+		values: ReadonlyMap<string, T | null>,
+		givenBases?: ReadonlyMap<string, Entry<T>>,
+	): void => {
 		const incoming = new Map<string, Incoming<T>>();
 		for (const [key, value] of values) {
+			const current = entries.get(key);
+			const base =
+				givenBases?.get(key) ??
+				(current !== undefined && isPending(key, current)
+					? bases.get(key)
+					: current);
 			const entry: Entry<T> = deepFreeze({
 				value,
 				deleted: value === null,
@@ -251,7 +294,7 @@ export function createCollection<T extends object>(
 					deepFreeze({ id: key, data: value, meta: metaOf(entry) }),
 				);
 			}
-			incoming.set(key, { entry });
+			incoming.set(key, base === undefined ? { entry } : { entry, base });
 		}
 		absorb(incoming, true);
 	};
@@ -261,6 +304,7 @@ export function createCollection<T extends object>(
 		for (const key of keys) {
 			entries.delete(key);
 			synced.delete(key);
+			bases.delete(key);
 			unsaved.delete(key);
 		}
 		notify(keys);
@@ -410,10 +454,65 @@ export function createCollection<T extends object>(
 		return mark === undefined || compareMarks(entry, mark) > 0;
 	};
 
+	/**
+	 * `theirs` is saved on the remote while `key` has an unsaved edit here. If someone else
+	 * saved it since this edit's base, returns the merge of both edits (saved as a new write).
+	 * If it's this device's own earlier save (e.g. one whose reply was lost), the edit builds
+	 * on it: it becomes the edit's base, and there's nothing to merge.
+	 */
+	const combine = (
+		key: string,
+		theirs: Entry<T>,
+		rebased: Map<string, Entry<T>>,
+	): T | undefined => {
+		const mine = entries.get(key);
+		if (mine === undefined || !isPending(key, mine)) return undefined;
+		if (compareMarks(mine, theirs) === 0) return undefined; // this very edit
+		const base = bases.get(key);
+		if (base !== undefined && compareMarks(theirs, base) <= 0) return undefined;
+		if (sameDevice(theirs.device, writer ?? "")) {
+			rebased.set(key, theirs);
+			return undefined;
+		}
+		if (mine.deleted || theirs.deleted) return undefined; // the later write wins
+		const mineIsLater = compareEntries(mine, theirs) > 0;
+		try {
+			const merged = ownValue(
+				mergeEdits(
+					base === undefined || base.deleted ? undefined : (base.value as T),
+					mine.value as T,
+					theirs.value as T,
+					{ key, mineIsLater },
+				),
+			);
+			options.onMerge?.({
+				key,
+				mine: mine.value as T,
+				theirs: theirs.value as T,
+				result: merged,
+			});
+			return merged;
+		} catch (error) {
+			// e.g. the merge result fails the validator: the later write wins instead.
+			handleError(error, {
+				source: "remote-validation",
+				collection: name,
+				id: key,
+			});
+			return undefined;
+		}
+	};
+
 	const mergeRemote: Collection<T>["mergeRemote"] = (remote, opts = {}) => {
 		assertActive();
 		const incoming = new Map<string, Incoming<T>>();
+		const merged = new Map<string, T>();
+		const rebased = new Map<string, Entry<T>>();
 		for (const [key, entry] of remote) {
+			if (opts.synced && hydrated) {
+				const combined = combine(key, entry, rebased);
+				if (combined !== undefined) merged.set(key, combined);
+			}
 			incoming.set(
 				key,
 				opts.synced
@@ -422,6 +521,17 @@ export function createCollection<T extends object>(
 			);
 		}
 		absorb(incoming, true);
+		for (const [key, base] of rebased) {
+			bases.set(key, deepFreeze(base));
+			unsaved.add(key);
+		}
+		if (rebased.size > 0) schedulePersist();
+		// Each merge is a new write, built on what the remote holds now.
+		if (merged.size > 0)
+			commit(
+				merged,
+				new Map([...merged.keys()].map((k) => [k, remote.get(k) as Entry<T>])),
+			);
 	};
 
 	const replaceAll = (values: ReadonlyMap<string, unknown>): void => {
@@ -491,6 +601,7 @@ export function createCollection<T extends object>(
 			for (const key of removed) {
 				entries.delete(key);
 				synced.delete(key);
+				bases.delete(key);
 			}
 			notify(removed);
 		},

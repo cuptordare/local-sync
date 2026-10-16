@@ -18,6 +18,14 @@ export interface LocalSyncErrorEvent {
 	error: unknown;
 }
 
+export interface LocalSyncMergeEvent {
+	collection: string;
+	id: string;
+	mine: unknown;
+	theirs: unknown;
+	result: unknown;
+}
+
 export type LocalSyncAppEventMap = {
 	/** A collection was registered (first `app.collection(name)` call for that name). */
 	"collection:created": { name: string };
@@ -26,6 +34,12 @@ export type LocalSyncAppEventMap = {
 	 * given), it is logged with `console.error` so it's never silently lost.
 	 */
 	error: LocalSyncErrorEvent;
+	/**
+	 * An edit made here and one someone else saved meanwhile were combined (see the `merge`
+	 * option); the result is saved. `mine` is this device's edit, to offer e.g. "Keep mine"
+	 * (`store.set(id, mine)`) where the later edit won a change both made.
+	 */
+	merged: LocalSyncMergeEvent;
 	/** The app was closed. */
 	disposed: undefined;
 };

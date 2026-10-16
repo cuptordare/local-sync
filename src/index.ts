@@ -5,6 +5,7 @@
 export type {
 	LocalSyncAppEventMap,
 	LocalSyncErrorEvent,
+	LocalSyncMergeEvent,
 } from "./app/app-events.js";
 export type { MultiTabOptions, TabLocks } from "./app/app-multi-tab.js";
 export type { AppSyncState, AppSyncStatus } from "./app/app-status.js";
@@ -49,6 +50,8 @@ export {
 	mergeEntries,
 	newerEntry,
 } from "./crdt/lww-map.js";
+export type { MergeContext, MergeFunction } from "./crdt/merge-values.js";
+export { mergeValues } from "./crdt/merge-values.js";
 // Shared, framework-neutral types that public APIs build on.
 export type { EventMap, Listener, Unsubscribe } from "./events/event-types.js";
 // Importing data stored by earlier versions of the library.

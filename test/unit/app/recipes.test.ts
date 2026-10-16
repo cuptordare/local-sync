@@ -153,7 +153,7 @@ describe("app.keyValue: syncing between clients", () => {
 		await Promise.all([a.app.close(), b.app.close()]);
 	});
 
-	it("concurrent edits to the same key converge on the later write, everywhere", async () => {
+	it("concurrent edits to one list keep both changes, everywhere", async () => {
 		const server = createFakeBlobServer<Todo>({ cas: true });
 		const a = client(server);
 		const b = client(server);
@@ -170,12 +170,12 @@ describe("app.keyValue: syncing between clients", () => {
 		await b.app.sync();
 		await a.app.sync();
 
+		// B found A's save when it went to save its own, and merged the two.
+		const both = { items: ["base", "from B", "from A"] };
 		for (const value of [a.todos.get("shared"), b.todos.get("shared")]) {
-			assert.deepEqual(value, { items: ["base", "from B"] });
+			assert.deepEqual(value, both);
 		}
-		assert.deepEqual(server.values().get("shared"), {
-			items: ["base", "from B"],
-		});
+		assert.deepEqual(server.values().get("shared"), both);
 		await Promise.all([a.app.close(), b.app.close()]);
 	});
 

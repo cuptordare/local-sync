@@ -172,13 +172,13 @@ the same moment can overwrite one save, and nothing notices. Use them.
 - Others' changes are fetched on load, on reconnect, **when the user comes back to the page**
   (`syncWhenVisible`, on by default), and every `syncIntervalMs` while it stays open. A minute or
   more is usually plenty for that interval.
-- **Each key ends with its latest write, on every device.** If two people change the same key
-  before either has seen the other's change, the later change wins everywhere (by a clock
-  that never puts an edit before one it has seen; see [Sync semantics](#sync-semantics)).
-  There's no merge code to write, and nothing to resolve.
-- **Model with many small keys, not one big value.** Two people editing *different* keys both
-  keep their change. Two people editing the same big value (e.g. a whole list stored under
-  one key) at the same time don't: the later value replaces the earlier one entirely.
+- **Edits made at the same time are combined, not lost.** If someone saves a key while your
+  device still has an unsaved edit to it (even one made from an old view), the two edits are
+  merged: objects field by field, lists item by item. Only where both changed the *same*
+  thing does the later edit win. See [Concurrent edits](#concurrent-edits). Every device ends
+  with the same value.
+- **Two people editing *different* keys never interact at all**, so many small keys is still
+  the most predictable model where people collaborate a lot.
 - **Moving from an older version of this library?** See [Upgrading from the
   `{ records }` format](#upgrading-from-the--records--format).
 
@@ -302,7 +302,7 @@ These all used to be things each app had to remember:
 | aggregating per-collection sync state | provides one `app.status` and one `app.sync()` |
 | tabs showing stale data, and every tab polling | keeps open tabs in step, with one tab syncing |
 | a save erasing another device's changes | merges per key on every save, with compare-and-swap |
-| writing merge code for edits made at the same time | resolves them per key: the latest write wins, the same on every device |
+| writing merge code for edits made at the same time | merges them (fields, list items), the same on every device |
 
 ## Examples
 
@@ -354,8 +354,8 @@ logical clock**. Everything else follows from it.
   The merge is commutative, associative and idempotent, so it doesn't matter in what order, or
   how often, things arrive. A stale pull, a push repeated after its reply was lost, two tabs
   syncing at once, or a message from another tab arriving late can't undo a newer write.
-- **Whole values.** The latest write to a key replaces its value entirely; fields aren't
-  merged. Keep keys small (see Recipe 2) where people edit at the same time.
+- **Concurrent edits** to one key are merged before either replaces the other; see
+  [Concurrent edits](#concurrent-edits).
 - **Deletes** are entries with `deleted: true` ("tombstones"), so other devices learn about them
   and an older write can't bring the value back. They're kept for **30 days** (about 90
   characters each), then a push drops them, and each device removes the key once its own copy
@@ -393,6 +393,44 @@ logical clock**. Everything else follows from it.
 - **Sources** (`app.source`) don't sync entries: each refresh fetches every page and makes the
   local copy hold exactly what came back. Unchanged items keep their entry (no write, no
   re-render), and removed ones are deleted outright.
+
+### Concurrent edits
+
+The LWW map keeps devices in agreement, but on its own the later of two concurrent edits
+would replace the earlier one entirely, e.g. a phone that has shown the shopping list for an
+hour saving it without the items someone added meanwhile. So each unsaved edit remembers the
+value it started from (its *base*), and when a device reads the remote (on a pull, or just
+before it saves) and finds that someone else saved the key since that base, it merges the
+three and saves the result as a new write. That write comes after both edits, so it wins on
+every device, and it contains both.
+
+The default merge, `mergeValues`:
+
+| Both sides changed... | Result |
+|---|---|
+| different fields of an object | both changes (merged recursively) |
+| a list of strings/numbers/booleans | a set merge: both sides' additions kept, both sides' removals applied |
+| a list of objects that each have an `id` | merged item by item; an item one side removed and the other changed is kept |
+| the same field, or anything else, to different values | the later edit wins |
+
+Not merged: an edit against a delete (the later write wins), edits from two tabs of one device
+(they see each other at once), and a merge result your validator refuses (the later write wins,
+and it's reported as an app `"error"`). Lists merged as sets treat equal items as one.
+
+Your own rules go in `merge`, per store; it runs only in that situation, and returns the
+value to save:
+
+```ts
+const todos = app.keyValue<Todo>("todos", {
+  remote,
+  merge: (base, mine, theirs, { key, mineIsLater }) =>
+    mergeValues(base, mine, theirs, { key, mineIsLater }), // e.g. adjust the default's result
+});
+app.on("merged", ({ collection, id, mine, theirs, result }) => {
+  // e.g. "Combined with someone else's changes" -- and where the later edit won a change
+  // both made, offer "Keep mine": todos.set(id, mine)
+});
+```
 
 ### Storage adapters
 

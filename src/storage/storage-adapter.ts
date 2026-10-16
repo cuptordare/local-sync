@@ -7,13 +7,15 @@
  * write can never replace a newer one. IndexedDB and in-memory adapters are built in.
  */
 import type { Entry, Mark } from "../crdt/lww-map.js";
-import { laterMark, newerEntry } from "../crdt/lww-map.js";
+import { compareEntries, laterMark, newerEntry } from "../crdt/lww-map.js";
 
 /** What is stored per key. */
 export interface StoredEntry {
 	entry: Entry;
 	/** The newest write of this key the remote is known to hold (absent: never synced). */
 	synced?: Mark;
+	/** For an unsaved edit: the entry it was made from (used to merge concurrent edits). */
+	base?: Entry;
 }
 
 export interface StorageAdapter {
@@ -39,7 +41,10 @@ export interface StorageAdapter {
 	close(): Promise<void>;
 }
 
-/** The merge every adapter applies per key: the newer entry, and the later synced mark. */
+/**
+ * The merge every adapter applies per key: the newer entry (with its base), and the later
+ * synced mark.
+ */
 export function mergeStored(
 	stored: StoredEntry | undefined,
 	incoming: StoredEntry,
@@ -47,5 +52,16 @@ export function mergeStored(
 	if (stored === undefined) return incoming;
 	const entry = newerEntry(stored.entry, incoming.entry) as Entry;
 	const synced = laterMark(stored.synced, incoming.synced);
-	return synced === undefined ? { entry } : { entry, synced };
+	// The base belongs to its edit; for the same edit, the later (further rebased) one.
+	const base =
+		compareEntries(stored.entry, incoming.entry) === 0
+			? laterMark(stored.base, incoming.base)
+			: entry === stored.entry
+				? stored.base
+				: incoming.base;
+	return {
+		entry,
+		...(synced !== undefined ? { synced } : {}),
+		...(base !== undefined ? { base: base as Entry } : {}),
+	};
 }

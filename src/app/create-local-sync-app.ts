@@ -14,6 +14,7 @@ import type {
 	CollectionErrorInfo,
 } from "../collections/collection-types.js";
 import { createCollection } from "../collections/create-collection.js";
+import type { MergeFunction } from "../crdt/merge-values.js";
 import type { Listener, Unsubscribe } from "../events/event-types.js";
 import type { NetworkStatus } from "../network/network-status.js";
 import { createNetworkStatus } from "../network/network-status.js";
@@ -67,6 +68,12 @@ export interface ManagedSyncOptions {
 export interface CollectionConfig<T extends object> extends ManagedSyncOptions {
 	/** Validation for local writes (which throw), and for values from elsewhere (hidden if invalid). */
 	validator?: Validator<T>;
+	/**
+	 * How to combine an edit made here with one someone else saved meanwhile (both from
+	 * `base`). Default `mergeValues`: objects field by field, lists as sets (or by `id`), and
+	 * the later edit wins where both changed the same thing. See README "Concurrent edits".
+	 */
+	merge?: MergeFunction<T>;
 	/** Sync this collection through this adapter; the app creates and runs the engine. */
 	remote?: SyncAdapter<T>;
 }
@@ -76,6 +83,12 @@ export interface KeyValueOptions<T extends object> extends ManagedSyncOptions {
 	remote?: SyncAdapter<T>;
 	/** Validation for local writes (which throw), and for values from elsewhere (hidden if invalid). */
 	validator?: Validator<T>;
+	/**
+	 * How to combine an edit made here with one someone else saved meanwhile (both from
+	 * `base`). Default `mergeValues`: objects field by field, lists as sets (or by `id`), and
+	 * the later edit wins where both changed the same thing. See README "Concurrent edits".
+	 */
+	merge?: MergeFunction<T>;
 }
 
 export interface SourceOptions<T extends object, Filter, Cursor>
@@ -295,6 +308,15 @@ export function createLocalSyncApp(
 			...(config.validator !== undefined
 				? { validator: config.validator }
 				: {}),
+			...(config.merge !== undefined ? { merge: config.merge } : {}),
+			onMerge: ({ key, mine, theirs, result }) =>
+				ctx.events.emit("merged", {
+					collection: name,
+					id: key,
+					mine,
+					theirs,
+					result,
+				}),
 			clock: ctx.clock,
 			writerId: ctx.writerId,
 			onError: (error: unknown, info: CollectionErrorInfo) =>
