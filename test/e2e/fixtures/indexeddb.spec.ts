@@ -5,169 +5,211 @@ test.beforeEach(async ({ page }) => {
 	await page.waitForFunction(() => window.__lsReady === true);
 });
 
-test("persists records across a real page reload", async ({ page }) => {
+const entry = (value: unknown, stamp: number, device = "d.t") => ({
+	value,
+	deleted: false,
+	stamp,
+	device,
+});
+
+test("persists entries across a real page reload", async ({ page }) => {
 	const dbName = `persist-${test.info().testId}`;
-	await page.evaluate(async (databaseName) => {
-		const adapter = window.__ls.createIndexedDBAdapter({ databaseName });
-		const record = window.__ls.createEnvelope(
-			{ text: "survives reload" },
-			{ id: "note-1" },
-		);
-		await adapter.write("notes", record);
-		await adapter.close();
-	}, dbName);
+	await page.evaluate(
+		async ({ databaseName, stored }) => {
+			const adapter = window.__ls.createIndexedDBAdapter({ databaseName });
+			await adapter.merge("notes", new Map([["note-1", stored]]));
+			await adapter.close();
+		},
+		{
+			databaseName: dbName,
+			stored: { entry: entry({ text: "survives reload" }, 5) },
+		},
+	);
 
 	await page.reload();
 	await page.waitForFunction(() => window.__lsReady === true);
 
-	const records = await page.evaluate(async (databaseName) => {
+	const entries = await page.evaluate(async (databaseName) => {
 		const adapter = window.__ls.createIndexedDBAdapter({ databaseName });
-		return adapter.readAll("notes");
+		return [...(await adapter.readAll("notes"))];
 	}, dbName);
 
-	expect(records).toHaveLength(1);
-	expect(records[0].data.text).toBe("survives reload");
+	expect(entries).toEqual([
+		["note-1", { entry: entry({ text: "survives reload" }, 5) }],
+	]);
 });
 
-test("two adapters with the same databaseName share (collide on) the same database", async ({
+test("adapters share a database by name, and are isolated across names", async ({
 	page,
 }) => {
-	const dbName = `collide-${test.info().testId}`;
-	const seenByB = await page.evaluate(async (databaseName) => {
-		const a = window.__ls.createIndexedDBAdapter({ databaseName });
-		await a.write(
-			"notes",
-			window.__ls.createEnvelope({ text: "from a" }, { id: "shared" }),
-		);
-		const b = window.__ls.createIndexedDBAdapter({ databaseName });
-		return b.readAll("notes");
-	}, dbName);
-	expect(seenByB).toHaveLength(1);
-	expect(seenByB[0].data.text).toBe("from a");
-});
-
-test("adapters with different databaseNames are isolated from each other", async ({
-	page,
-}) => {
-	const dbA = `isolated-a-${test.info().testId}`;
-	const dbB = `isolated-b-${test.info().testId}`;
-	const seenByOther = await page.evaluate(
-		async ({ dbA, dbB }) => {
-			const a = window.__ls.createIndexedDBAdapter({ databaseName: dbA });
-			await a.write(
-				"notes",
-				window.__ls.createEnvelope({ text: "only in a" }, { id: "x" }),
-			);
-			const other = window.__ls.createIndexedDBAdapter({ databaseName: dbB });
-			return other.readAll("notes");
+	const dbName = `share-${test.info().testId}`;
+	const seen = await page.evaluate(
+		async ({ databaseName, stored }) => {
+			const a = window.__ls.createIndexedDBAdapter({ databaseName });
+			await a.merge("notes", new Map([["shared", stored]]));
+			const b = window.__ls.createIndexedDBAdapter({ databaseName });
+			const other = window.__ls.createIndexedDBAdapter({
+				databaseName: `${databaseName}-other`,
+			});
+			return {
+				same: (await b.readAll("notes")).size,
+				other: (await other.readAll("notes")).size,
+			};
 		},
-		{ dbA, dbB },
+		{ databaseName: dbName, stored: { entry: entry({ text: "from a" }, 1) } },
 	);
-	expect(seenByOther).toHaveLength(0);
+	expect(seen).toEqual({ same: 1, other: 0 });
 });
 
 test("close() then a subsequent operation reopens the database", async ({
 	page,
 }) => {
 	const dbName = `reopen-${test.info().testId}`;
-	const result = await page.evaluate(async (databaseName) => {
-		const adapter = window.__ls.createIndexedDBAdapter({ databaseName });
-		await adapter.write(
-			"notes",
-			window.__ls.createEnvelope({ text: "a" }, { id: "x" }),
-		);
-		await adapter.close();
-		// The adapter must transparently reopen the DB after close(), not stay dead.
-		const read = await adapter.read("notes", "x");
-		return read?.data.text;
-	}, dbName);
-	expect(result).toBe("a");
+	const size = await page.evaluate(
+		async ({ databaseName, stored }) => {
+			const adapter = window.__ls.createIndexedDBAdapter({ databaseName });
+			await adapter.merge("notes", new Map([["x", stored]]));
+			await adapter.close();
+			// The adapter must transparently reopen the DB after close(), not stay dead.
+			return (await adapter.readAll("notes")).size;
+		},
+		{ databaseName: dbName, stored: { entry: entry("a", 1) } },
+	);
+	expect(size).toBe(1);
 });
 
-test("regression: a failed open is retried, not cached forever (dbPromise fix)", async ({
+test("regression: a failed open is retried, not cached forever", async ({
 	page,
 }) => {
 	const dbName = `fail-retry-${test.info().testId}`;
 	const opens = await page.evaluate(async (databaseName) => {
-		// Create the DB at version 2 first, then close the connection.
-		const v2 = window.__ls.createIndexedDBAdapter({ databaseName, version: 2 });
-		await v2.write(
-			"notes",
-			window.__ls.createEnvelope({ text: "seed" }, { id: "x" }),
-		);
-		await v2.close();
-
-		// Wrap indexedDB.open to count real open attempts.
+		// A database already at version 2: the adapter's version-1 open fails (VersionError).
+		await new Promise<void>((resolve, reject) => {
+			const request = indexedDB.open(databaseName, 2);
+			request.onsuccess = () => {
+				request.result.close();
+				resolve();
+			};
+			request.onerror = () => reject(request.error);
+		});
 		let openCalls = 0;
 		const countingFactory = {
-			open: (...args) => {
+			open: (name: string, version?: number) => {
 				openCalls += 1;
-				return indexedDB.open(...args);
+				return indexedDB.open(name, version);
 			},
-		};
-
-		// Requesting a LOWER version than what already exists always fails (VersionError).
-		// With the bug, the first failure's rejected promise would be cached forever and
-		// every subsequent call would replay it WITHOUT calling factory.open() again. With
-		// the fix, each call retries -- so openCalls must increase on the second attempt.
+		} as IDBFactory;
 		const stale = window.__ls.createIndexedDBAdapter({
 			databaseName,
-			version: 1,
 			indexedDB: countingFactory,
 		});
-
-		let firstFailed = false;
-		try {
-			await stale.read("notes", "x");
-		} catch {
-			firstFailed = true;
-		}
+		const attempt = () =>
+			stale.readAll("notes").then(
+				() => false,
+				() => true,
+			);
+		const firstFailed = await attempt();
 		const afterFirst = openCalls;
-
-		let secondFailed = false;
-		try {
-			await stale.read("notes", "x");
-		} catch {
-			secondFailed = true;
-		}
-		const afterSecond = openCalls;
-
-		return { firstFailed, secondFailed, afterFirst, afterSecond };
+		const secondFailed = await attempt();
+		return { firstFailed, secondFailed, afterFirst, afterSecond: openCalls };
 	}, dbName);
-
-	expect(opens.firstFailed).toBe(true);
-	expect(opens.secondFailed).toBe(true);
-	expect(opens.afterFirst).toBe(1);
-	expect(opens.afterSecond).toBe(2); // proves the second call retried instead of reusing a cached rejection
+	expect(opens).toEqual({
+		firstFailed: true,
+		secondFailed: true,
+		afterFirst: 1,
+		afterSecond: 2, // the second call retried instead of reusing a cached rejection
+	});
 });
 
-test("update() is atomic: concurrent read-modify-writes from two connections lose nothing", async ({
+test("merge is atomic: concurrent merges from two connections keep the newest entry", async ({
 	page,
 }) => {
 	const dbName = `atomic-${test.info().testId}`;
-	const count = await page.evaluate(async (databaseName) => {
-		// Two connections, like two tabs of one app.
+	const final = await page.evaluate(async (databaseName) => {
+		// Two connections, like two tabs of one app, writing stamps 1..40 in a shuffled order.
 		const a = window.__ls.createIndexedDBAdapter({ databaseName });
 		const b = window.__ls.createIndexedDBAdapter({ databaseName });
-		await a.write(
-			"notes",
-			window.__ls.createEnvelope({ count: 0 }, { id: "counter" }),
+		const stamps = Array.from({ length: 40 }, (_, i) => i + 1).sort(
+			() => Math.random() - 0.5,
 		);
-		const increment = (adapter: typeof a) =>
-			adapter.update?.("notes", ["counter"], ([stored]) => ({
-				write: [
-					{
-						...stored,
-						data: { count: (stored.data as { count: number }).count + 1 },
-					},
-				],
-				remove: [],
-			}));
 		await Promise.all(
-			Array.from({ length: 20 }, () => [increment(a), increment(b)]).flat(),
+			stamps.map((stamp, i) =>
+				(i % 2 === 0 ? a : b).merge(
+					"notes",
+					new Map([
+						[
+							"k",
+							{ entry: { value: stamp, deleted: false, stamp, device: "d.t" } },
+						],
+					]),
+				),
+			),
 		);
-		const final = await a.read("notes", "counter");
-		return (final?.data as { count: number } | undefined)?.count;
+		return (await a.readAll("notes")).get("k")?.entry.stamp;
 	}, dbName);
-	expect(count).toBe(40);
+	expect(final).toBe(40);
+});
+
+test("data an older library version stored is imported on load, and left in place", async ({
+	page,
+}) => {
+	const dbName = `legacy-${test.info().testId}`;
+	const result = await page.evaluate(async (databaseName) => {
+		// Exactly what the old library (and an old app version) wrote: version 1, one
+		// "records" store with a by_collection index, rows { key, collection, record }.
+		await new Promise<void>((resolve, reject) => {
+			const request = indexedDB.open(databaseName, 1);
+			request.onupgradeneeded = () => {
+				const store = request.result.createObjectStore("records", {
+					keyPath: "key",
+				});
+				store.createIndex("by_collection", "collection", { unique: false });
+			};
+			request.onsuccess = () => {
+				const db = request.result;
+				const tx = db.transaction("records", "readwrite");
+				const record = (id: string, data: unknown, deleted = false) => ({
+					key: `todo\u0000${id}`,
+					collection: "todo",
+					record: {
+						id,
+						data,
+						meta: {
+							version: 4,
+							createdAt: 1_700_000_000_000,
+							updatedAt: 1_700_000_500_000,
+							deleted,
+							dirty: false,
+							source: "remote",
+						},
+					},
+				});
+				tx.objectStore("records").put(
+					record("todo:shared", { items: ["milk"] }),
+				);
+				tx.objectStore("records").put(record("todo:gone", { items: [] }, true));
+				tx.oncomplete = () => {
+					db.close();
+					resolve();
+				};
+				tx.onerror = () => reject(tx.error);
+			};
+			request.onerror = () => reject(request.error);
+		});
+
+		const app = window.__ls.createLocalSyncApp({ name: databaseName });
+		const todo = app.keyValue<{ items: string[] }>("todo");
+		await app.ready();
+		const imported = { shared: todo.get("todo:shared"), keys: todo.keys() };
+		await app.close();
+
+		const legacy = window.__ls.createIndexedDBAdapter({ databaseName });
+		const rows = await legacy.readLegacy?.("todo");
+		return { ...imported, legacyRows: rows?.length };
+	}, dbName);
+	expect(result).toEqual({
+		shared: { items: ["milk"] },
+		keys: ["todo:shared"],
+		legacyRows: 2, // the old rows are untouched (a backup, and still readable by old tabs)
+	});
 });

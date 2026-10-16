@@ -11,7 +11,7 @@
 // `onActivity` reports each request this device makes, so the page can show what actually
 // goes over the network (and when nothing does).
 
-const PREFIX = "household-demo-server:";
+const PREFIX = "household-demo-server-lww:";
 
 export function createFakeSheetServer({ latencyMs = 800 } = {}) {
 	let failing = false;
@@ -19,8 +19,9 @@ export function createFakeSheetServer({ latencyMs = 800 } = {}) {
 	const report = (entry) => {
 		for (const listener of listeners) listener(entry);
 	};
+	// Stored as { blob, etag }: the document the library saves, plus its version.
 	const load = (key) =>
-		JSON.parse(localStorage.getItem(PREFIX + key) ?? '{"records":[],"etag":0}');
+		JSON.parse(localStorage.getItem(PREFIX + key) ?? '{"blob":null,"etag":0}');
 
 	// One simulated round trip: wait, then run `handle` (or fail), and report the outcome.
 	const request = async (action, key, handle) => {
@@ -51,20 +52,22 @@ export function createFakeSheetServer({ latencyMs = 800 } = {}) {
 			return () => listeners.delete(listener);
 		},
 
-		// -> { records, etag }
+		// -> the saved document plus { etag }
 		read(key) {
 			return request("read", key, () => {
-				const blob = load(key);
-				const live = blob.records.filter((r) => !r.meta.deleted).length;
+				const { blob, etag } = load(key);
+				const live = Object.values(blob?.entries ?? {}).filter(
+					(e) => !e.deleted,
+				).length;
 				return {
-					result: { records: blob.records, etag: String(blob.etag) },
-					outcome: `${live} item(s), version ${blob.etag}`,
+					result: { ...blob, etag: String(etag) },
+					outcome: `${live} item(s), version ${etag}`,
 				};
 			});
 		},
 
 		// -> nothing, or { conflict: true } if the blob changed since `ifMatch` was read
-		write(key, { records }, { ifMatch }) {
+		write(key, blob, { ifMatch }) {
 			return request("write", key, () => {
 				const current = load(key);
 				if (ifMatch !== undefined && ifMatch !== String(current.etag)) {
@@ -76,7 +79,7 @@ export function createFakeSheetServer({ latencyMs = 800 } = {}) {
 				}
 				localStorage.setItem(
 					PREFIX + key,
-					JSON.stringify({ records, etag: current.etag + 1 }),
+					JSON.stringify({ blob, etag: current.etag + 1 }),
 				);
 				return {
 					result: undefined,

@@ -5,7 +5,8 @@ A zero-dependency, local-first data library for TypeScript/JavaScript apps.
 Your app reads and writes a local copy of its data, so the UI is instant and keeps working
 offline. The library saves that copy on the device (IndexedDB) and keeps it in step with a
 remote in the background. It handles the parts that are easy to get wrong: paging, retries,
-offline, conflicting edits, removed items, and save-on-a-short-delay.
+offline, edits made at the same time on several devices, removed items, and
+save-on-a-short-delay.
 
 - **Zero runtime dependencies.** ESM only (`"type": "module"`). No framework required.
 - **Two ready-made recipes** for the common cases: [read-only data from an outside
@@ -95,10 +96,9 @@ interface Item { text: string; done: boolean }
 const remote = createBlobSyncAdapter<Item>({
   read: async () => {
     const res = await fetch("/api/blobs/shopping");
-    if (res.status === 404) return { records: [], etag: "0" }; // nothing saved yet
+    if (res.status === 404) return { etag: "0" }; // nothing saved yet
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const body = await res.json();
-    return { records: body.records, etag: res.headers.get("ETag") ?? undefined };
+    return { ...(await res.json()), etag: res.headers.get("ETag") ?? undefined };
   },
   write: async (blob, { ifMatch }) => {
     const res = await fetch("/api/blobs/shopping", {
@@ -117,7 +117,6 @@ const shopping = app.keyValue<Item>("shopping", {
   defaultValue: () => ({ text: "", done: false }), // optional: what get() returns for a key never set
   syncIntervalMs: 60_000,                          // also check for others' changes every minute
 });
-app.on("conflict", ({ id }) => toast(`Someone else changed "${id}" first`));
 
 await app.ready(); // the copy saved on this device is loaded
 
@@ -149,20 +148,21 @@ stop();                                          // stop watching
 JSON document per name: a Google Sheet behind Apps Script, a gist, an S3 object, a KV store. The
 backend needs to:
 
-1. **Store the blob as is.** The adapter sends `{ records: [...] }`. Save it unchanged and
-   return the same thing on read. The adapter merges records itself: it reads, replaces only
-   the records it's pushing, and writes back, so other devices' records are kept.
+1. **Store the blob as is.** The library sends `{ format: "lww-1", entries: { ... } }` (one
+   entry per key, see [Sync semantics](#sync-semantics)). Save it unchanged and return the
+   same thing on read. A save always contains every device's keys: the library reads, merges
+   its changes in, and writes the result back.
 2. **Version it.** Every save changes a version stamp (the *etag*), which `read` returns. Return
-   one even when nothing is saved yet (`{ records: [], etag: "0" }` above).
+   one even when nothing is saved yet (`{ etag: "0" }` above).
 3. **Honor `ifMatch`.** `write` receives the etag from the read the write is based on. If the
    stored etag is different, someone else saved in between: don't save, and have `write`
-   return `{ conflict: true }`. The adapter then re-reads, re-applies its changes, and tries
-   again. Do the compare and the save as one step (e.g. under a lock).
+   return `{ conflict: true }`. The library then re-reads, merges again, and tries again. Do
+   the compare and the save as one step (e.g. under a lock).
 4. **Fail loudly.** `read` and `write` must throw on any error. Never return an empty blob for
    a failed read.
 
-Without etags (have `read` return none and ignore `ifMatch`), everything still works, but two
-devices saving at exactly the same moment can overwrite each other's save.
+Without etags (`read` returns none and `ifMatch` is ignored), two devices saving at exactly
+the same moment can overwrite one save, and nothing notices. Use them.
 
 **How it behaves:**
 
@@ -172,123 +172,62 @@ devices saving at exactly the same moment can overwrite each other's save.
 - Others' changes are fetched on load, on reconnect, **when the user comes back to the page**
   (`syncWhenVisible`, on by default), and every `syncIntervalMs` while it stays open. A minute or
   more is usually plenty for that interval.
-- If someone else saved the same key since you last synced, your edit is **detected, not
-  silently overwritten**. The merge strategy decides the outcome (default: their saved version
-  wins), and `app.on("conflict")` lets you tell the user.
-- **Model with many small keys, not one big value.** Two people editing *different* keys never
-  conflict. Two people editing the same big value (e.g. a whole list stored under one key) do,
-  and one of the edits loses.
+- **Each key ends with its latest write, on every device.** If two people change the same key
+  before either has seen the other's change, the later change wins everywhere (by a clock
+  that never puts an edit before one it has seen; see [Sync semantics](#sync-semantics)).
+  There's no merge code to write, and nothing to resolve.
+- **Model with many small keys, not one big value.** Two people editing *different* keys both
+  keep their change. Two people editing the same big value (e.g. a whole list stored under
+  one key) at the same time don't: the later value replaces the earlier one entirely.
+- **Moving from an older version of this library?** See [Upgrading from the
+  `{ records }` format](#upgrading-from-the--records--format).
 
 Runnable: [`examples/key-value-household`](examples/key-value-household).
 
-### Recipe 3: custom backend and rules
+### Recipe 3: records with generated ids, or your own backend
 
-For when neither fits: your own API, records with generated ids, live queries over the whole
-set, or your own way of resolving conflicts. You use `app.collection`, the layer both recipes
-above are built on, and write the `SyncAdapter` (the two functions that talk to your server)
-yourself.
-
-This example is a notes app against a REST API. On a conflict, it keeps both versions of the
-text.
+For when neither recipe fits: records with generated ids and live queries over the whole set
+(`app.collection`, the layer both recipes are built on), or a backend that isn't "one blob"
+(write the `SyncAdapter` yourself).
 
 ```ts
-import {
-  createLocalSyncApp, custom, fromGuard, preferDeletion,
-  type PushRejection, type RecordEnvelope, type SyncAdapter,
-} from "localsync";
+import { createLocalSyncApp, fromGuard, type SyncAdapter, type Entry } from "localsync";
 
 interface Note { title: string; body: string }
 
-// A note as your server sends it.
-interface ServerNote {
-  id: string; title: string; body: string;
-  version: number;    // goes up on every save
-  deleted: boolean;   // deleted notes are kept, so other devices learn about the delete
-  createdAt: number; updatedAt: number;
-}
-
-// The library stores every record as { id, data, meta }. Convert the server's shape to that.
-const toRecord = (n: ServerNote): RecordEnvelope<Note> => ({
-  id: n.id,
-  data: { title: n.title, body: n.body },
-  meta: {
-    version: n.version, deleted: n.deleted, createdAt: n.createdAt, updatedAt: n.updatedAt,
-    dirty: false, source: "remote",
-  },
-});
-
-const app = createLocalSyncApp({ name: "notes-app" });
-
-// 1. The remote: fetch changes (pull) and save changes (push).
-const remote: SyncAdapter<Note, unknown, number> = {
-  // Fetch notes changed since `cursor`. It's undefined on the first pull after a page load,
-  // so that pull fetches everything. Throw on any failure.
-  async pull({ cursor }) {
-    const res = await fetch(`/api/notes?since=${cursor ?? 0}`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const body: { notes: ServerNote[]; nextSince: number; hasMore: boolean } = await res.json();
-    return { records: body.notes.map(toRecord), cursor: body.nextSince, hasMore: body.hasMore };
-  },
-
-  // Save local changes, all in one request. A delete arrives as a record with meta.deleted.
-  async push(mutations) {
-    const res = await fetch("/api/notes/save", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(mutations.map((m) => ({
-        id: m.recordId,
-        ...m.record.data,
-        deleted: m.record.meta.deleted,
-        baseVersion: m.record.meta.remoteVersion, // the server version this edit started from
-      }))),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    // One result per note, in the order sent: { saved } or { conflict } (the server's copy).
-    const results: Array<{ saved?: ServerNote; conflict?: ServerNote }> = await res.json();
-
-    const acked: string[] = [];
-    const records: RecordEnvelope<Note>[] = [];
-    const rejected: PushRejection<Note>[] = [];
-    mutations.forEach(({ mutationId }, i) => {
-      const result = results[i];
-      if (result?.saved) {
-        acked.push(mutationId);
-        records.push(toRecord(result.saved)); // the saved copy, with its new version
-      } else if (result?.conflict) {
-        rejected.push({ mutationId, reason: "Changed by someone else", record: toRecord(result.conflict) });
-      }
-    });
-    return { acked, records, rejected };
-  },
-};
-
-// 2. Your rules.
 const isNote = (d: unknown): d is Note =>
   typeof d === "object" && d !== null &&
   typeof (d as Note).title === "string" && typeof (d as Note).body === "string";
 
-// Runs only when the same note changed here and on the server. Returns the note to keep.
-const keepBothBodies = custom<Note>((local, remote) =>
-  local.data.body === remote.data.body
-    ? remote // same text: nothing to combine
-    : {
-        ...remote,
-        data: { ...remote.data, body: `${remote.data.body}\n\n${local.data.body}` },
-        meta: { ...remote.meta, dirty: true, source: "local" }, // dirty: push the combined note
-      });
+// A remote is two functions: read every entry, and write them back unless someone else
+// wrote since that read. Here: a JSON document behind an HTTP API with ETags.
+const remote: SyncAdapter<Note> = {
+  async read() {
+    const res = await fetch("/api/notes");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`); // always throw on failure
+    const body: { entries: Record<string, Entry<Note>> } = await res.json();
+    return { entries: new Map(Object.entries(body.entries)), etag: res.headers.get("ETag") ?? undefined };
+  },
+  async write(entries, { ifMatch }) {
+    const res = await fetch("/api/notes", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", ...(ifMatch ? { "If-Match": ifMatch } : {}) },
+      body: JSON.stringify({ entries: Object.fromEntries(entries) }),
+    });
+    if (res.status === 412) return { conflict: true };
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  },
+};
 
-// 3. The collection.
+const app = createLocalSyncApp({ name: "notes-app" });
 const notes = app.collection<Note>("notes", {
   remote,
-  validator: fromGuard(isNote, "Expected { title, body }"), // checks your writes AND the server's data
-  merge: preferDeletion(keepBothBodies),                    // ...but a delete on either side wins
+  validator: fromGuard(isNote, "Expected { title, body }"), // checks your writes; hides bad remote data
   syncIntervalMs: 60_000,
 });
-app.on("conflict", ({ id }) => toast(`Note ${id} was also edited elsewhere; both versions kept`));
-
 await app.ready();
 
-// 4. Read and write. Each record is { id, data, meta }; your values are in `data`.
+// Read and write. Each record is { id, data, meta }; your values are in `data`.
 const id = notes.insert({ title: "Ideas", body: "" });  // -> a generated id
 notes.update(id, { body: "Ship it" });                   // change some fields
 notes.replace(id, { title: "Plans", body: "Ship it" });  // replace all the fields
@@ -296,7 +235,7 @@ notes.upsert("welcome", { title: "Welcome", body: "" }); // insert or replace, a
 notes.peek(id)?.data;                                    // -> { title: "Plans", body: "Ship it" }
 notes.delete(id);
 
-// 5. Live queries. subscribe() only reports changes, so render once first.
+// Live queries. subscribe() only reports changes, so render once first.
 const drafts = notes.query((note) => note.title.startsWith("Draft"));
 render(drafts.getCurrentResult()); // -> RecordEnvelope<Note>[]
 drafts.subscribe(render);
@@ -304,64 +243,45 @@ drafts.subscribe(render);
 
 | Call | What it does |
 | --- | --- |
-| `insert(data, { id? })` | Adds a record and returns its id (generated unless you pass one). Throws if that id exists. |
+| `insert(data, { id? })` | Adds a record and returns its id (generated unless you pass one). Throws if a record exists at that id. |
 | `update(id, patch)` | Changes the fields you pass and keeps the rest. Throws if the record doesn't exist. |
 | `replace(id, data)` | Replaces all the fields. Throws if the record doesn't exist. |
 | `upsert(id, data)` | Inserts or replaces. Also restores a deleted record. |
 | `delete(id)` | Deletes the record, here and on the server. |
 | `peek(id)` | The record now (`{ id, data, meta }`), or `undefined`. Not live. |
 | `get(id)`, `query(predicate?)` | Live versions: read `getCurrentResult()`, then `subscribe` for changes. |
-| `pending()` | Records with changes not yet pushed. |
+| `pending()` | The ids with changes the remote doesn't have yet (deletes included). |
 
-**What your server must do:**
+**What your server must do:** the same as for Recipe 2: store what `write` sends, return it
+from `read`, version it with an etag, refuse a write whose `ifMatch` is stale, and fail
+loudly. It never has to understand the entries: merging happens in the library.
 
-1. **Version every note.** Each save raises its `version`. Return the version with every note.
-2. **Keep deleted notes** as `deleted: true` and return them from pulls, so other devices
-   remove them too.
-3. **Report changes since a point.** `GET /api/notes?since=N` returns the notes changed after
-   `N`, including deletions, plus `nextSince` (where the next pull continues) and `hasMore`
-   (whether to fetch another page now). Use a server-side change counter or timestamp for `N`,
-   never the client's clock.
-4. **Check the base version.** Save a note only if its stored version equals `baseVersion`
-   (or it doesn't exist yet and `baseVersion` is missing). Otherwise someone else saved it
-   first: don't save it, and return the stored copy as `conflict`. The library then runs your
-   merge, emits `"conflict"`, and pushes the result if it's marked `dirty`.
-5. **Fail loudly.** Return an error status for failures, so `pull` and `push` throw.
-
-**Variations:**
-
-- **No "changes since" support?** Have `pull` return every note, and set `complete: true` on the
-  last page. Local notes missing from that snapshot are removed, as in Recipe 1.
-- **Read-only, or no server yet?** Leave out `push`, or leave out `remote` entirely for a
+- **Read-only, or no server yet?** Leave out `write`, or leave out `remote` entirely for a
   device-only store.
-- **Built-in merge strategies:** `serverWins()` (default: the server's copy wins and the local
-  edit is dropped), `lastWriteWins()`, `custom(fn)`, and `preferDeletion(strategy)`. See
-  [Sync semantics](#sync-semantics).
 - **Sync options** are the same as Recipe 2 (`syncIntervalMs`, `pushDebounceMs`, `retry`). Pass
   `autoSync: false` to sync only when you call `app.sync()` or `app.engine("notes")`.
 
 The [sync playground](#examples) shows these pieces in action, with two clients side by side.
 
-## Status, errors, and conflicts
+## Status and errors
 
 One status covers everything the app syncs. Bind your "Saving… / Saved / Offline / Couldn't
 sync" badge to it:
 
 ```ts
-// { phase, online, pending, pushScheduled, rejected, lastError, lastSyncedAt }
+// { phase, online, pending, pushScheduled, lastError, lastSyncedAt }
 renderBadge(app.status.get());   // subscribe() only reports changes, so render once first
 app.status.subscribe(renderBadge);
 app.on("error", ({ source, collection, error }) => report(error)); // storage, sync, invalid remote data
-app.on("conflict", ({ collection, id }) => toast("Someone else changed this first"));
 await app.sync(); // e.g. a "Retry" button; rejects if anything failed
 ```
 
 - `phase` is `"error"` from a failed sync **until that direction (push or pull) succeeds
   again**, including while it retries in the background, so a badge shows the failure instead
-  of flashing it. A sync still pulls when its push fails, so one change the server won't
-  accept doesn't stop you receiving everyone else's.
-- `rejected` counts changes the server refused outright. They stay on the device but aren't
-  retried until edited again, so show them as "couldn't save", not "saving".
+  of flashing it. A push reads and merges the remote before it writes, so even a push that
+  keeps failing doesn't stop you receiving everyone else's changes.
+- `pending` counts keys with changes the remote doesn't have yet. They're kept on the device
+  (also across reloads) and pushed on the next successful sync.
 - Nothing fails silently. Background errors go to `app.on("error")`. If nothing listens,
   they're logged with `console.error`.
 
@@ -374,15 +294,15 @@ These all used to be things each app had to remember:
 | hand-rolling a debounced save | debounces pushes after local edits, and flushes them when the page is hidden or closed |
 | `peek ? replace : insert` helpers | offers `set` / `upsert` (insert or replace) |
 | inserting placeholder records, then hiding them from sync | provides `defaultValue`, which is never stored or pushed |
-| marking pulled data "clean" in every adapter | normalizes remote data itself, so it can never be mistaken for a local edit |
-| cramming a list into one record so deletions show up | removes items a full snapshot no longer contains |
-| fetching only page 1 | follows `hasMore`/cursor through every page, and errors on a looping adapter |
-| validating server responses by hand | runs your validator on incoming data and skips (and reports) invalid records |
+| tracking what still needs saving | knows per key whether the remote has the latest write, across reloads |
+| cramming a list into one record so deletions show up | keeps deletes as entries, and removes items a full snapshot no longer contains |
+| fetching only page 1 | follows every page, and errors on a looping `fetchPage` |
+| validating server responses by hand | runs your validator on incoming data, and hides (and reports) invalid values |
 | `structuredClone` on every read | freezes stored data, so mutating it throws instead of silently corrupting state |
 | aggregating per-collection sync state | provides one `app.status` and one `app.sync()` |
-| tabs showing stale data, and every tab polling | keeps open tabs in step through shared storage, with one tab syncing |
-| last-write-silently-wins | detects conflicting edits, resolves them with the merge strategy, and reports them |
-| unbounded tombstones | removes acknowledged deletes |
+| tabs showing stale data, and every tab polling | keeps open tabs in step, with one tab syncing |
+| a save erasing another device's changes | merges per key on every save, with compare-and-swap |
+| writing merge code for edits made at the same time | resolves them per key: the latest write wins, the same on every device |
 
 ## Examples
 
@@ -396,8 +316,8 @@ cd examples/<name> && npm start     # serves the repo root and opens that exampl
 | Example | What it shows |
 |---|---|
 | [`read-only-issues`](examples/read-only-issues) | **Recipe 1.** A GitHub-style issues dashboard against a simulated paginated API (real `Response`s, `Link` headers). Paging, snapshot removal, filters, offline copy, status. |
-| [`key-value-household`](examples/key-value-household) | **Recipe 2.** A shared shopping list over a simulated Sheets-style blob server with etags and network latency, plus a live log of every request. Granular keys, saving shortly after edits, checking for others' changes, offline, conflicts, multiple devices and tabs. |
-| [`vanilla-js-notes-app`](examples/vanilla-js-notes-app) | **Sync playground.** Two clients side by side on the low-level API, with merge-strategy switches, manual push/pull, and failure injection. It's for exploring edge cases, not a template. |
+| [`key-value-household`](examples/key-value-household) | **Recipe 2.** A shared shopping list over a simulated Sheets-style blob server with etags and network latency, plus a live log of every request. Granular keys, saving shortly after edits, checking for others' changes, offline, multiple devices and tabs. |
+| [`vanilla-js-notes-app`](examples/vanilla-js-notes-app) | **Sync playground.** Two clients side by side on the low-level API, with manual push/pull, offline toggles, and failure injection, to watch concurrent edits resolve. It's for exploring edge cases, not a template. |
 
 ## Advanced: the low-level API
 
@@ -410,66 +330,67 @@ escape hatch.
 | Concept | What it is |
 |---|---|
 | **App** (`createLocalSyncApp`) | Owns storage, the collection registry, and the sync engines for collections with a `remote`. |
-| **Collection** (`app.collection(name)` / `createCollection`) | A typed set of records: CRUD + live queries. |
-| **RecordEnvelope** | `{ id, data, meta }`: your data, plus sync bookkeeping (`version`, `dirty`, `deleted`, timestamps, `source`, `remoteVersion`). |
+| **Collection** (`app.collection(name)` / `createCollection`) | A typed set of records: CRUD + live queries, stored as one LWW map. |
+| **Entry** | What's stored per key: `{ value, deleted, stamp, device }`. Deletes are entries too. |
+| **LWW map** | Entries by key. Merging two keeps, per key, the entry with the greater `(stamp, device)`. |
+| **Hybrid logical clock** (`createHybridClock`) | Makes the stamps: wall-clock time, but always later than every stamp it has seen. |
+| **RecordEnvelope** | What reads return: `{ id, data, meta: { stamp, device, updatedAt } }`. Frozen. |
 | **ReactiveQuery** | A live, lazily-subscribed derived value (`collection.get(id)`, `collection.query()`). `subscribe` does **not** fire immediately; read `getCurrentResult()` first. |
-| **SyncAdapter** | The contract for a backend: `pull` is required; `push` is optional (read-only sources are first-class). |
-| **SyncEngine** (`createSyncEngine`) | Drives pull/push for one collection: paging, retries, status, offline gating, debounced auto-push. |
-| **MergeStrategy** | Resolves a local-vs-remote conflict: `serverWins()` (default), `lastWriteWins()`, `custom()`, `preferDeletion()`. |
+| **SyncAdapter** | The contract for a remote: `read()` all entries, and `write(entries, { ifMatch })` (optional: read-only remotes are first-class). |
+| **SyncEngine** (`createSyncEngine`) | Drives pull/push for one collection: retries, status, offline gating, debounced auto-push. |
 
 ### Sync semantics
 
-- **Optimistic, version-ordered writes.** Every mutation applies to the in-memory store
-  synchronously (bumping `meta.version` and setting `meta.dirty`), then is persisted on a serialized
-  queue, so writes always land in version order. Data is copied and deep-frozen on the way in.
-- **The push backlog *is* `meta.dirty`.** `collection.pending()` returns the dirty records.
-  A change made offline is still pending after a reload.
-- **Pulls** follow pages while the adapter returns `hasMore` with a new `cursor`. A page with
-  `complete: true` marks the end of a full snapshot: local clean records not seen in it are
-  removed (dirty ones are kept, and nothing is removed if any page failed).
-- **Remote data is normalized and checked.** Incoming records are marked `source: "remote"`,
-  `dirty: false`, and stamped with `meta.remoteVersion`. Live ones go through the validator, and
-  records identical to the local copy are skipped.
-- **`keepPendingOnPull` (default `true`).** A pull won't overwrite a record that has un-pushed
-  local edits; your change stays visible until it's pushed.
-- **Conflict detection.** `meta.remoteVersion` records which remote version a local edit was
-  based on. An adapter can reject a stale push with `rejected: [{ mutationId, reason, record }]`
-  (the server's current copy). The engine resolves it with the merge strategy, emits `"conflict"`,
-  and pushes the result if it still has local changes. A rejection *without* a `record` holds the
-  change back (`status.rejected`) until it's edited again, so it's never re-sent in a loop.
-  `createBlobSyncAdapter` implements all of this for you.
-- **Push race protection.** Only records whose version is unchanged since the push started get
-  the server's response applied or get marked synced. An edit made during the round-trip stays
-  pending, now based on the version the server accepted, so it's never lost or mistaken for a
-  conflict.
-- **Lost replies.** Each device has a random id, kept in its storage, and local edits are
-  stamped with it (`meta.writer`). If a push is saved but its reply never arrives, the next
-  push finds this device's own save on the server. It recognises it as such, not as someone
-  else's change, and the newer edit simply builds on it. For this, your adapter must store
-  `meta.writer` and return it; `createBlobSyncAdapter` does. Adapters that don't behave as
-  before, where the merge strategy resolves it.
-- **`purgeDeletedOnPush` (default `false`).** Acknowledged tombstones are removed locally. Only
-  turn it on if your adapter's pulls stop returning a tombstone once it's acknowledged. Adapters
-  that keep tombstones, such as `createBlobSyncAdapter`, would re-add them on every pull, and a
-  deleted key set again would be rejected as stale.
-- **Merge strategies** run only on genuine conflicts (both sides changed):
-  - `serverWins()`: the remote copy wins; the local edit is **discarded** (default).
-  - `lastWriteWins()`: higher `meta.version` wins, then later `meta.updatedAt`.
-  - `custom((local, remote) => merged)`: you decide. Return `meta.dirty: true` if the result
-    still needs pushing.
-  - `preferDeletion(strategy)`: a tombstone on either side wins outright. Wrap your strategy
-    with it if a pending delete must never be resurrected by a racing pull.
+The data model is a textbook state-based CRDT: a **last-writer-wins map** ordered by a **hybrid
+logical clock**. Everything else follows from it.
+
+- **Entries and stamps.** Each key holds one entry: `{ value, deleted, stamp, device }`. The
+  `stamp` is `wall-clock ms * 1000 + a counter`, from a clock that never goes backwards and
+  always moves past any stamp it has received. So a write made after seeing another write gets
+  a later stamp, even if this device's clock is behind. `device` is a random id kept per device,
+  plus a short id per tab, so no two writes share a `(stamp, device)`.
+- **One merge for everything.** A local write, a pull, another tab's write, the stored copy:
+  each is merged the same way, keeping per key the entry with the greater `(stamp, device)`.
+  The merge is commutative, associative and idempotent, so it doesn't matter in what order, or
+  how often, things arrive. A stale pull, a push repeated after its reply was lost, two tabs
+  syncing at once, or a message from another tab arriving late can't undo a newer write.
+- **Whole values.** The latest write to a key replaces its value entirely; fields aren't
+  merged. Keep keys small (see Recipe 2) where people edit at the same time.
+- **Deletes** are entries with `deleted: true` ("tombstones"), so other devices learn about them
+  and an older write can't bring the value back. They're kept indefinitely (about 90 characters
+  each in a blob).
+- **Pull** reads the remote's entries and merges them in. **Push** reads, merges, and if this
+  side has entries the remote lacks, writes the merge of both with `ifMatch`; on
+  `{ conflict: true }` it reads, merges and tries again.
+- **Use etags, and never roll the remote back.** A device remembers which writes the remote
+  holds, and doesn't send them again. Without etags, two devices saving at the same moment can
+  overwrite one save, and the device that made it won't notice (until that key is edited
+  again). The same goes for restoring an older copy of the blob: to start over, save under a
+  new name instead.
+- **Pending.** A key is pending while its entry is newer than the newest one the remote is
+  known to hold. That's tracked per key in storage, so a change made offline is still pending
+  after a reload. `status.pending` counts them.
+- **Remote data is validated, but can't be refused.** Every device has to hold the same entries
+  to agree, so an entry whose value fails your validator is kept but hidden: reads treat the key
+  as missing, and it's reported as an app `"error"` (`source: "remote-validation"`), until a
+  valid write replaces it.
+- **Clocks.** A device whose clock is far ahead wins ties of "who wrote last" for edits made at
+  about the same time, and pulls every other clock forward with it (stamps never go back). Edits
+  made after seeing its write still win, as always.
 - **Error handling.** Calling `engine.pull()/push()/sync()` (or `app.sync()`) yourself rejects on
   failure. Background work (auto-push, intervals, reconnects) never rejects; it reports through
   `sync:error` / `app.on("error")` and `status`.
 - **Retry/backoff** is exponential with jitter: `retry: { maxAttempts, baseDelayMs, maxDelayMs, factor, jitter }`.
 - **Before loading finishes.** The engine waits for the collection to load before syncing. Local
-  writes need the stored data first, so every write before then (`insert`, `upsert`/`set`,
-  `update`, `replace`, `delete`) throws a clear "await app.ready()" error, rather than guessing.
-  Reads work right away and fill in once loading finishes. If loading fails, it's retried on the
-  next sync (or `collection.load()`).
-- **`delete()` is idempotent** once loaded: deleting a missing or already-deleted record is a no-op.
-  **`insert()` throws** if a record already exists at the given `id`; use `upsert()` to replace.
+  writes need the stored data first (a write must be stamped after everything it could have
+  seen), so every write before then throws a clear "await app.ready()" error. Reads work right
+  away and fill in once loading finishes. If loading fails, it's retried on the next sync, by
+  `app.ready()`, or by `collection.load()`.
+- **`delete()` is idempotent** once loaded: deleting a missing or already-deleted record is a
+  no-op. **`insert()` throws** if a record exists at the given `id`; use `upsert()` to replace.
+- **Sources** (`app.source`) don't sync entries: each refresh fetches every page and makes the
+  local copy hold exactly what came back. Unchanged items keep their entry (no write, no
+  re-render), and removed ones are deleted outright.
 
 ### Storage adapters
 
@@ -477,19 +398,19 @@ escape hatch.
   `createIndexedDBAdapter({ databaseName })`. It uses one object store for all collections, opens
   lazily, and steps aside if a newer version of the app needs to upgrade the database.
 - **`createMemoryAdapter()`**: data is lost on reload. Good for tests and Node.
-- **Your own**: implement `StorageAdapter`. `read`/`readAll` must return copies, because
-  collections freeze what they load. If several tabs share it, also implement `update`
-  (read, decide and write as one atomic step, like an IndexedDB readwrite transaction):
-  without it, another tab's write can slip in between a read and a write, and an edit can be
-  lost. The built-in adapters implement it.
+- **Your own**: implement `StorageAdapter`: `readAll`, `merge`, `remove` and `close`. `merge` must
+  merge, not overwrite (use the exported `mergeStored` per key), and must read and write as
+  one atomic step (like an IndexedDB readwrite transaction) if several tabs share the storage.
+  `readAll` must return copies, because collections freeze what they load.
 
 ### Multi-tab
 
 When an app persists to IndexedDB via `name`, its open tabs share that database, and the app
 keeps them consistent automatically:
 
-- An edit in one tab shows up in the others right away. After a write lands, the tab
-  announces it, and other tabs re-read just those records from storage.
+- An edit in one tab shows up in the others right away. After a write lands in storage, the
+  tab sends the stored entries to the other tabs, which merge them. Since storage is written by
+  merging too, tabs and storage agree whatever order things happen in.
 - **Only one tab syncs automatically.** It's elected with the browser's Web Locks API: the
   first tab leads, and when it closes or crashes, the browser hands the lock to the next tab
   right away, with no timers or heartbeats. Other tabs show the leader's `app.status`. Manual
@@ -506,13 +427,10 @@ or `multiTab: false` to opt out. To run it outside a browser (e.g. in tests), pa
 `multiTab: { channel, locks }`: any `TabChannel` (such as `createInMemoryChannelHub().connect()`)
 and any object with `LockManager`'s `request(name, callback)` shape.
 
-`createMultiTabSync()` (heartbeat-based leader election plus `broadcast()`/`onBroadcast()`) is
-also exported as a separate primitive for building your own coordination.
-
 ### Validation
 
 Collections accept any `Validator<T>`. It runs on local writes (which throw `ValidationError`)
-and on incoming remote data (invalid records are skipped and reported):
+and on values from elsewhere (invalid ones are hidden and reported):
 
 ```ts
 import { fromGuard } from "localsync";
@@ -525,11 +443,38 @@ app.keyValue("notes", { validator: fromGuard(isNote, "Expected { text: string }"
 
 Wrap any schema library's `.parse`/`.safeParse` the same way; nothing is bundled.
 
+### Upgrading from the `{ records }` format
+
+Versions of this library before the LWW map stored "records" (`{ id, data, meta }`), on the
+device and in remote blobs (`{ records: [...] }`). Both are imported automatically:
+
+- **On the device**, the IndexedDB adapter leaves the old rows where they are and imports them
+  when a collection loads. Each record becomes an entry stamped from its `meta.updatedAt`,
+  written by the fixed device `"legacy"`, so every device imports the same record identically.
+- **The remote**: save the new format under a **new** name, and pass the old one as `legacy`:
+
+  ```ts
+  createBlobSyncAdapter<Item>({
+    read: () => api.get("shopping:lww"),
+    write: (blob, { ifMatch }) => api.set("shopping:lww", blob, ifMatch),
+    legacy: { read: () => api.get("shopping") }, // only read, never written
+  });
+  ```
+
+  While the new blob is empty, the old one is imported, and the next push saves the merge into
+  the new blob. The old one stays as it was, as a backup. Don't write the new format over the
+  old name: an older app version would read no records there, and save over it. The adapter
+  refuses to read an old-format blob as the new one, for the same reason.
+- Edits made with the new version are stamped later than the data they were made from, so
+  they win over imported values. An old app version still running somewhere keeps using the old
+  storage and blob; its later edits are picked up when that device loads the new version (the
+  local import runs on every load and only takes records newer than what's stored).
+
 ### What's public vs. internal
 
 `src/index.ts` is the only supported entry point. `debounce`, `deepEqual`, `deepFreeze`,
-`createDisposableBag`, `createId`, `now`, `createCollectionStore`, `buildMutations`,
-`defaultSleep`, and `EventBus`/`createEventBus` are internal and may change without notice.
+`createDisposableBag`, `createId`, `now`, `createEngine`, `defaultSleep`, and
+`EventBus`/`createEventBus` are internal and may change without notice.
 
 ## Dev workflow
 
@@ -550,8 +495,8 @@ There is no CI yet. Run `npm run test:all` before submitting changes, and
 ### Randomized tests
 
 `test/fuzz/` simulates two devices with two tabs each, editing shared keys while syncing
-through one server, with random latency, outages, offline periods, failed loads and tab
-reloads. After each scenario settles it checks that every tab and every device's storage
+through one server, with random latency, outages, lost replies, offline periods, failed loads
+and tab reloads. After each scenario settles it checks that every tab and every device's storage
 agree with the server, and that no edit was lost. That is, a key ends with its last write, or
 with a concurrent write that the last one never saw.
 

@@ -28,10 +28,10 @@ const network = createNetworkStatus(); // follows the browser; the toggle below 
 // 1. One app. Its name is the IndexedDB database the data is saved in.
 const app = createLocalSyncApp({ name: `household-demo-${device}`, network });
 
-// 2. A key-value store synced through the server. createBlobSyncAdapter does the careful
-//    part: it only replaces what changed and detects conflicting edits. The list uses ONE
-//    KEY PER ITEM, so two people ticking off different items never conflict (they would if
-//    the whole list were one value).
+// 2. A key-value store synced through the server. Every save merges with what's there, per
+//    key, so no one's changes are erased; if two people change the SAME key, the later change
+//    wins on every device. The list uses ONE KEY PER ITEM, so two people ticking off
+//    different items both keep their change (they wouldn't if the whole list were one value).
 const shopping = app.keyValue("shopping", {
 	remote: createBlobSyncAdapter({
 		read: () => server.read("shopping"),
@@ -39,11 +39,6 @@ const shopping = app.keyValue("shopping", {
 	}),
 	syncIntervalMs: Number(params.get("syncMs") ?? 30_000), // catch others' changes while open
 });
-
-// 3. Tell the user when someone else's edit won (default merge: the saved version wins).
-app.on("conflict", () =>
-	toast("Someone else changed this item first -- showing their version."),
-);
 
 // ---------------------------------- UI ----------------------------------------
 const $ = (selector) => document.querySelector(selector);
@@ -87,22 +82,18 @@ $("#add-form").addEventListener("submit", (event) => {
 
 // One status: Saving / Saved / Offline / Error. "Saving…" means YOUR changes haven't reached
 // the server yet -- not that a background check for others' changes is running.
-// (`rejected` changes are pending too, but won't be retried until edited again.)
 function renderStatus(s) {
 	const state = !s.online
 		? "offline"
 		: s.phase === "error"
 			? "error"
-			: s.rejected > 0
-				? "rejected"
-				: s.pushScheduled || s.pending > 0
-					? "saving"
-					: "saved";
+			: s.pushScheduled || s.pending > 0
+				? "saving"
+				: "saved";
 	$("#status").dataset.state = state;
 	$("#status-text").textContent = {
 		offline: `Offline -- ${s.pending} change(s) will sync when you're back`,
 		error: `Couldn't sync (${s.lastError}). Your changes are safe on this device.`,
-		rejected: `${s.rejected} change(s) couldn't be saved -- the server refused them.`,
 		saving: "Saving…",
 		saved: `All changes saved${s.lastSyncedAt ? ` · checked ${new Date(s.lastSyncedAt).toLocaleTimeString()}` : ""}`,
 	}[state];
@@ -133,11 +124,3 @@ $("#reset").addEventListener("click", async () => {
 	indexedDB.deleteDatabase(`household-demo-${device}`);
 	location.reload();
 });
-
-function toast(message) {
-	$("#toast").textContent = message;
-	$("#toast").hidden = false;
-	setTimeout(() => {
-		$("#toast").hidden = true;
-	}, 4000);
-}

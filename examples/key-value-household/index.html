@@ -92,13 +92,7 @@
         #status[data-state="saved"] { background: var(--ok-bg); color: var(--ok); }
         #status[data-state="saving"] { background: var(--warn-bg); color: var(--warn); }
         #status[data-state="offline"] { background: var(--warn-bg); color: var(--warn); }
-        #status[data-state="error"], #status[data-state="rejected"] { background: var(--bad-bg); color: var(--bad); }
-
-        #toast {
-            position: fixed; bottom: 1rem; left: 50%; transform: translateX(-50%);
-            background: var(--text); color: var(--bg); padding: 0.6rem 1rem; border-radius: 0.5rem;
-            max-width: calc(100% - 2rem);
-        }
+        #status[data-state="error"] { background: var(--bad-bg); color: var(--bad); }
 
         #activity {
             list-style: none; margin: 0.5rem 0 0; padding: 0; max-height: 14rem; overflow-y: auto;
@@ -169,7 +163,6 @@
         </div>
     </main>
 
-    <div id="toast" role="alert" hidden></div>
 
     <script type="module" src="./main.js"></script>
 </body>

@@ -6,12 +6,12 @@ import { expect, type Page, test } from "@playwright/test";
 //
 // The example renders two independent client panels (#client-a / #client-b) sharing one
 // mock backend, so most tests exercise a single panel like a normal app, while the
-// conflict/pending-edit tests deliberately drive both. `?latencyMs=` overrides the mock
+// concurrent-edit tests deliberately drive both. `?latencyMs=` overrides the mock
 // backend's simulated round-trip so runs here are fast and deterministic.
 //
 // Auto-sync (push on change + poll) is ON by default, matching normal app behavior -- most
 // tests below rely on that and never touch the Push/Pull/Sync buttons at all. Tests that
-// need to deliberately orchestrate a race (conflicts, the pending-edit protection, the
+// need to deliberately orchestrate a race (concurrent edits, the pending-edit protection, the
 // error/retry demo) turn it off first via disableAutoSync(), the same knob a developer
 // would use to instrument those edge cases.
 async function disableAutoSync(page: Page, ...panels: string[]) {
@@ -106,17 +106,10 @@ test.describe("vanilla-js-notes-app example (smoke)", () => {
 	test("a pending delete is not resurrected by a pull that hasn't seen it yet", async ({
 		page,
 	}) => {
-		// Regression test: a delete is a dirty tombstone, so it goes through the same merge
-		// path as any other edit. If a pull races ahead of the delete's own push -- easy to
-		// hit with auto-sync's periodic polling, or here, explicitly, via keepPendingOnPull=false
-		// -- a merge strategy that doesn't check `meta.deleted` can resurrect the "deleted" note,
-		// only for it to vanish again on the next pull once the delete actually lands.
-		// preferDeletion() (wired in client.js's resolveMerge) is what prevents this. (With the
-		// default keepPendingOnPull=true, a dirty tombstone would never even reach merge --
-		// this test forces the merge path specifically to prove preferDeletion works within it.)
-		await page.goto(
-			"/examples/vanilla-js-notes-app/?latencyMs=50&keepPendingOnPull=false",
-		);
+		// A delete is an entry stamped later than the note it deletes, so a pull that races
+		// ahead of the delete's own push (easy to hit with auto-sync's periodic polling, or
+		// here, explicitly) brings an OLDER copy of the note, which must not bring it back.
+		await page.goto("/examples/vanilla-js-notes-app/?latencyMs=50");
 		await expect(page.locator("#client-a .client-body")).toBeVisible();
 		await disableAutoSync(page, "#client-a");
 
@@ -137,15 +130,13 @@ test.describe("vanilla-js-notes-app example (smoke)", () => {
 		await expect(item).toHaveCount(0); // removed immediately (optimistic)
 
 		// Pull now, BEFORE the delete has been pushed -- the backend still has the old,
-		// non-deleted record. A merge strategy that ignores tombstones would resurrect it
-		// here. Wait for the pull to actually finish (not just for the click to dispatch) --
+		// non-deleted note. Wait for the pull to actually finish (not just for the click to dispatch) --
 		// asserting toHaveCount(0) immediately would trivially pass since it's ALREADY 0 from
 		// the optimistic delete above, without ever observing an async resurrection.
 		await page.click("#client-a .pull-btn");
 		await page.waitForTimeout(300); // 6x latencyMs -- safely past the pull's round-trip
 		await expect(item).toHaveCount(0); // must still be gone, not flicker back
-		// The delete must still be tracked as un-pushed -- a buggy merge would have marked
-		// the resurrected record clean, silently losing the pending delete.
+		// The delete must still be tracked as un-pushed, or it would never reach the server.
 		await expect(page.locator("#client-a .pending-badge")).toHaveText(
 			"1 pending",
 		);
@@ -319,15 +310,10 @@ test.describe("vanilla-js-notes-app example (smoke)", () => {
 		await expect(bRow.locator(".note-text")).toContainText("B is drafting...");
 	});
 
-	test("conflicting edits are resolved by the configured merge strategy on pull", async ({
+	test("concurrent edits to one note: the later edit wins, on both clients", async ({
 		page,
 	}) => {
-		// Demo default merge is `custom` (deterministic text combine); keepPendingOnPull must
-		// be forced to false here since the default (true) would just keep B's edit optimistic
-		// and never invoke merge at all -- this test is specifically about the merge path.
-		await page.goto(
-			"/examples/vanilla-js-notes-app/?latencyMs=50&keepPendingOnPull=false",
-		);
+		await page.goto("/examples/vanilla-js-notes-app/?latencyMs=50");
 		await expect(page.locator("#client-a .client-body")).toBeVisible();
 		await expect(page.locator("#client-b .client-body")).toBeVisible();
 		await disableAutoSync(page, "#client-a", "#client-b");
@@ -344,95 +330,42 @@ test.describe("vanilla-js-notes-app example (smoke)", () => {
 		await page.click("#client-a .push-btn");
 		await expect(page.locator("#client-a .pending-badge")).toHaveText(
 			"0 pending",
-			{
-				timeout: 5_000,
-			},
+			{ timeout: 5_000 },
 		);
 		await page.click("#client-b .pull-btn");
 		await expect(bRow).toBeVisible();
 
-		// Diverge: edit the SAME note differently on both sides, without syncing yet.
+		// Diverge: edit the SAME note on both sides without syncing, A first, then B.
 		await aRow.locator(".edit-btn").click();
 		await aRow.locator(".edit-textarea").fill("A version");
 		await aRow.locator(".save-btn").click();
-
+		await page.waitForTimeout(20); // B's edit is clearly the later one
 		await bRow.locator(".edit-btn").click();
 		await bRow.locator(".edit-textarea").fill("B version");
 		await bRow.locator(".save-btn").click();
 
-		// Push A's edit to the shared backend, then Pull on B -- B is still dirty, so this
-		// forces the still-un-pushed B edit through the configured merge strategy.
+		// A saves first. B's pull brings A's (earlier) edit: B keeps its own, still unsaved.
 		await page.click("#client-a .push-btn");
 		await expect(page.locator("#client-a .pending-badge")).toHaveText(
 			"0 pending",
-			{
-				timeout: 5_000,
-			},
+			{ timeout: 5_000 },
 		);
 		await page.click("#client-b .pull-btn");
-
-		await expect(bRow.locator(".note-text")).toContainText(
-			"A version ⟷ B version",
-			{
-				timeout: 5_000,
-			},
+		await page.waitForTimeout(300);
+		await expect(bRow.locator(".note-text")).toContainText("B version");
+		await expect(page.locator("#client-b .pending-badge")).toHaveText(
+			"1 pending",
 		);
-	});
 
-	test("serverWins merge strategy discards the local edit on pull", async ({
-		page,
-	}) => {
-		// keepPendingOnPull=false forces B's still-dirty edit through the merge path instead
-		// of staying optimistic -- see the "conflicting edits" test above for why.
-		await page.goto(
-			"/examples/vanilla-js-notes-app/?latencyMs=50&merge=serverWins&keepPendingOnPull=false",
+		// B saves (merging with A's save on the server); then A gets B's edit too.
+		await page.click("#client-b .push-btn");
+		await expect(page.locator("#client-b .pending-badge")).toHaveText(
+			"0 pending",
+			{ timeout: 5_000 },
 		);
-		await expect(page.locator("#client-a .client-body")).toBeVisible();
-		await expect(page.locator("#client-b .client-body")).toBeVisible();
-		await disableAutoSync(page, "#client-a", "#client-b");
-
-		await page.fill("#client-a .note-input", "Shared note");
-		await page.click("#client-a .add-btn");
-		const seedItem = page.locator("#client-a .notes-list li", {
-			hasText: "Shared note",
+		await page.click("#client-a .pull-btn");
+		await expect(aRow.locator(".note-text")).toContainText("B version", {
+			timeout: 5_000,
 		});
-		const noteId = await seedItem.getAttribute("data-id");
-		const aRow = page.locator(`#client-a li[data-id="${noteId}"]`);
-		const bRow = page.locator(`#client-b li[data-id="${noteId}"]`);
-
-		await page.click("#client-a .push-btn");
-		await expect(page.locator("#client-a .pending-badge")).toHaveText(
-			"0 pending",
-			{
-				timeout: 5_000,
-			},
-		);
-		await page.click("#client-b .pull-btn");
-		await expect(bRow).toBeVisible();
-
-		await bRow.locator(".edit-btn").click();
-		await bRow
-			.locator(".edit-textarea")
-			.fill("B version (should be discarded)");
-		await bRow.locator(".save-btn").click();
-
-		await aRow.locator(".edit-btn").click();
-		await aRow.locator(".edit-textarea").fill("A version (server)");
-		await aRow.locator(".save-btn").click();
-		await page.click("#client-a .push-btn");
-		await expect(page.locator("#client-a .pending-badge")).toHaveText(
-			"0 pending",
-			{
-				timeout: 5_000,
-			},
-		);
-
-		await page.click("#client-b .pull-btn");
-		await expect(bRow.locator(".note-text")).toContainText(
-			"A version (server)",
-			{
-				timeout: 5_000,
-			},
-		);
 	});
 });
