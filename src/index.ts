@@ -2,14 +2,31 @@
  * Public exports are added here.
  */
 
-export type { LocalSyncAppEventMap } from "./app/app-events.js";
+export type {
+	LocalSyncAppEventMap,
+	LocalSyncConflictEvent,
+	LocalSyncErrorEvent,
+} from "./app/app-events.js";
+export type { MultiTabOptions, TabLocks } from "./app/app-multi-tab.js";
+export type { AppSyncState, AppSyncStatus } from "./app/app-status.js";
 export type {
 	CollectionConfig,
 	CreateLocalSyncAppOptions,
+	KeyValueOptions,
 	LocalSyncApp,
+	ManagedSyncOptions,
+	SourceOptions,
 } from "./app/create-local-sync-app.js";
-// App runtime -- the single entry point that wires everything together.
+// App runtime -- the single entry point that wires everything together, including the two
+// recipes: app.keyValue() (simple named values) and app.source() (read-only outside data).
 export { createLocalSyncApp } from "./app/create-local-sync-app.js";
+export type { KeyValueStore, WatchOptions } from "./app/key-value-store.js";
+export type {
+	ReadonlyCollection,
+	Source,
+	SourceFetchArgs,
+	SourcePage,
+} from "./app/source.js";
 export type {
 	CollectionChange,
 	RecordChange,
@@ -18,6 +35,7 @@ export type {
 export type {
 	ApplyRemoteOptions,
 	Collection,
+	CollectionErrorInfo,
 	CreateCollectionOptions,
 	InsertOptions,
 	MutateOptions,
@@ -95,6 +113,14 @@ export type {
 } from "./storage/storage-adapter.js";
 export type { StorageEngine } from "./storage/storage-engine.js";
 export { createStorageEngine } from "./storage/storage-engine.js";
+export type {
+	BlobSnapshot,
+	BlobSyncAdapterOptions,
+	BlobWriteOptions,
+	BlobWriteResult,
+} from "./sync/adapters/blob-sync-adapter.js";
+// Ready-made adapter for "one JSON blob per collection" backends (Sheets/Apps Script, gist, S3...).
+export { createBlobSyncAdapter } from "./sync/adapters/blob-sync-adapter.js";
 export type { CreateSyncEngineOptions } from "./sync/create-sync-engine.js";
 // Sync -- remote synchronization (adapter contract, engine, status, events, retries).
 export { createSyncEngine } from "./sync/create-sync-engine.js";
@@ -102,10 +128,15 @@ export type {
 	Mutation,
 	PullArgs,
 	PullResult,
+	PushRejection,
 	PushResult,
 	SyncAdapter,
 } from "./sync/sync-adapter.js";
-export type { SyncEngine, SyncStartOptions } from "./sync/sync-engine.js";
+export type {
+	PushOnChangeOptions,
+	SyncEngine,
+	SyncStartOptions,
+} from "./sync/sync-engine.js";
 export type { SyncDirection, SyncEventMap } from "./sync/sync-events.js";
 export type { RetryOptions, Sleep } from "./sync/sync-retries.js";
 export { computeBackoff, withRetry } from "./sync/sync-retries.js";

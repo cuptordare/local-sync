@@ -43,6 +43,20 @@ export interface RecordMeta {
 	dirty: boolean;
 	/** Origin of the current version's data. */
 	source: RecordSource;
+	/**
+	 * The remote's `version` of this record as of the last time this copy was in agreement
+	 * with it (set when remote data is applied and when a push is acknowledged; carried
+	 * through local edits). Lets an adapter detect a stale write: if the remote's current
+	 * version differs, someone else changed the record since this edit's base. Absent on
+	 * records that have never been synced.
+	 */
+	remoteVersion?: number;
+	/**
+	 * The device that made the latest local edit (an id the library creates once per device).
+	 * Stored with the record on the remote, so a device can recognise its own earlier save
+	 * there -- e.g. one whose reply was lost -- rather than treating it as a conflict.
+	 */
+	writer?: string;
 }
 
 export interface CreateEnvelopeOptions {
@@ -135,10 +149,20 @@ export function deleteEnvelope<T>(
 	};
 }
 
-/** Mark as synced (dirty -> false). Returns the same reference if already clean. */
+/**
+ * Mark as synced (dirty -> false): the remote now holds exactly this version, so it also
+ * becomes the `remoteVersion`. Returns the same reference if already clean.
+ */
 export function markSynced<T>(envelope: RecordEnvelope<T>): RecordEnvelope<T> {
 	if (!envelope.meta.dirty) return envelope;
-	return { ...envelope, meta: { ...envelope.meta, dirty: false } };
+	return {
+		...envelope,
+		meta: {
+			...envelope.meta,
+			dirty: false,
+			remoteVersion: envelope.meta.version,
+		},
+	};
 }
 
 /** Mark as having local changes (dirty -> true). Same reference if already dirty. */

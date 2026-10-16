@@ -23,6 +23,8 @@ export interface CollectionStore<T> {
 	setMany(records: readonly RecordEnvelope<T>[]): void;
 	/** Hard-remove one record from memory and notify. Returns whether it existed. */
 	remove(id: string): boolean;
+	/** Hard-remove multiple records and notify once. Returns the ids that existed. */
+	removeMany(ids: readonly string[]): string[];
 	/** Subscribe to change batches. Returns an unsubscribe function. */
 	subscribe(listener: Listener<readonly RecordChange<T>[]>): Unsubscribe;
 }
@@ -61,6 +63,11 @@ export function createCollectionStore<T>(): CollectionStore<T> {
 			if (!records.delete(id)) return false;
 			notify([{ kind: "removed", id }]);
 			return true;
+		},
+		removeMany(ids) {
+			const removed = ids.filter((id) => records.delete(id));
+			notify(removed.map((id) => ({ kind: "removed", id })));
+			return removed;
 		},
 		subscribe(listener) {
 			listeners.add(listener);

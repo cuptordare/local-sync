@@ -15,16 +15,19 @@ interface Note {
 
 const wait = (ms = 10) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function makeCollection() {
-	return createCollection<Note>({
+/** A hydrated collection (as after `await app.ready()`), so pull/push reach the adapter synchronously. */
+async function makeCollection() {
+	const collection = createCollection<Note>({
 		name: "notes",
 		storage: createStorageEngine(createMemoryAdapter()),
 	});
+	await collection.ready;
+	return collection;
 }
 
 describe("create-sync-engine: pull", () => {
 	it("applies pulled records into the collection", async () => {
-		const collection = makeCollection();
+		const collection = await makeCollection();
 		const adapter = createFakeSyncAdapter<Note>({ readOnly: true });
 		const engine = createSyncEngine({
 			collection,
@@ -54,7 +57,7 @@ describe("create-sync-engine: pull", () => {
 	});
 
 	it("keepPendingOnPull=true (default) preserves a locally-dirty record", async () => {
-		const collection = makeCollection();
+		const collection = await makeCollection();
 		const id = collection.insert({ n: 1 });
 		const adapter = createFakeSyncAdapter<Note>({ readOnly: true });
 		const engine = createSyncEngine({
@@ -85,7 +88,7 @@ describe("create-sync-engine: pull", () => {
 	});
 
 	it("setFilter resets the cursor for the next pull", async () => {
-		const collection = makeCollection();
+		const collection = await makeCollection();
 		const adapter = createFakeSyncAdapter<Note>({ readOnly: true });
 		const engine = createSyncEngine({
 			collection,
@@ -113,7 +116,7 @@ describe("create-sync-engine: pull", () => {
 
 describe("create-sync-engine: push", () => {
 	it("pushes pending records and marks them synced on ack", async () => {
-		const collection = makeCollection();
+		const collection = await makeCollection();
 		const id = collection.insert({ n: 1 });
 		const adapter = createFakeSyncAdapter<Note>();
 		const engine = createSyncEngine({
@@ -133,7 +136,7 @@ describe("create-sync-engine: push", () => {
 	});
 
 	it("is a no-op when there is nothing pending", async () => {
-		const collection = makeCollection();
+		const collection = await makeCollection();
 		const adapter = createFakeSyncAdapter<Note>();
 		const engine = createSyncEngine({
 			collection,
@@ -145,7 +148,7 @@ describe("create-sync-engine: push", () => {
 	});
 
 	it("is a no-op for a read-only (pull-only) adapter", async () => {
-		const collection = makeCollection();
+		const collection = await makeCollection();
 		collection.insert({ n: 1 });
 		const adapter = createFakeSyncAdapter<Note>({ readOnly: true });
 		const engine = createSyncEngine({
@@ -158,7 +161,7 @@ describe("create-sync-engine: push", () => {
 	});
 
 	it("dedupes concurrent push() calls into a single adapter call", async () => {
-		const collection = makeCollection();
+		const collection = await makeCollection();
 		collection.insert({ n: 1 });
 		const adapter = createFakeSyncAdapter<Note>();
 		const engine = createSyncEngine({
@@ -179,7 +182,7 @@ describe("create-sync-engine: push", () => {
 	});
 
 	it("a call requested while running re-runs for records dirtied in the meantime", async () => {
-		const collection = makeCollection();
+		const collection = await makeCollection();
 		collection.insert({ n: 1 });
 		const adapter = createFakeSyncAdapter<Note>();
 		const engine = createSyncEngine({
@@ -206,7 +209,7 @@ describe("create-sync-engine: push", () => {
 	});
 
 	it("protects against a stale push response after the record changed mid-flight (version-mismatch)", async () => {
-		const collection = makeCollection();
+		const collection = await makeCollection();
 		const id = collection.insert({ n: 1 }); // version 1, dirty
 		const adapter = createFakeSyncAdapter<Note>();
 		const engine = createSyncEngine({
@@ -258,7 +261,7 @@ describe("create-sync-engine: push", () => {
 
 describe("create-sync-engine: sync (push then pull)", () => {
 	it("calls push then pull, and emits sync:success", async () => {
-		const collection = makeCollection();
+		const collection = await makeCollection();
 		collection.insert({ n: 1 });
 		const adapter = createFakeSyncAdapter<Note>();
 		const engine = createSyncEngine({
@@ -284,7 +287,7 @@ describe("create-sync-engine: sync (push then pull)", () => {
 	});
 
 	it("dedupes concurrent sync() calls into a single in-flight run, plus one more requested round", async () => {
-		const collection = makeCollection();
+		const collection = await makeCollection();
 		const adapter = createFakeSyncAdapter<Note>({ readOnly: true });
 		const engine = createSyncEngine({
 			collection,
@@ -309,7 +312,7 @@ describe("create-sync-engine: sync (push then pull)", () => {
 
 describe("create-sync-engine: retry/backoff", () => {
 	it("retries a failing pull via the injected sleep, then succeeds", async () => {
-		const collection = makeCollection();
+		const collection = await makeCollection();
 		let attempts = 0;
 		const sleepCalls: number[] = [];
 		const adapter: SyncAdapter<Note> = {
@@ -335,7 +338,7 @@ describe("create-sync-engine: retry/backoff", () => {
 
 describe("create-sync-engine: offline gating", () => {
 	it("pull/push/sync no-op immediately when offline", async () => {
-		const collection = makeCollection();
+		const collection = await makeCollection();
 		collection.insert({ n: 1 });
 		const adapter = createFakeSyncAdapter<Note>();
 		const network = createFakeNetworkStatus(false);
@@ -354,7 +357,7 @@ describe("create-sync-engine: offline gating", () => {
 	});
 
 	it("reconnecting triggers an automatic sync when started", async () => {
-		const collection = makeCollection();
+		const collection = await makeCollection();
 		const adapter = createFakeSyncAdapter<Note>({ readOnly: true });
 		const network = createFakeNetworkStatus(false);
 		const engine = createSyncEngine({
@@ -375,7 +378,7 @@ describe("create-sync-engine: offline gating", () => {
 
 describe("create-sync-engine: pushOnChange", () => {
 	it("schedules a push automatically when the collection changes", async () => {
-		const collection = makeCollection();
+		const collection = await makeCollection();
 		const adapter = createFakeSyncAdapter<Note>();
 		const engine = createSyncEngine({
 			collection,
@@ -383,7 +386,7 @@ describe("create-sync-engine: pushOnChange", () => {
 			sleep: createInstantSleep(),
 		});
 
-		engine.start({ pushOnChange: true, syncOnStart: false });
+		engine.start({ pushOnChange: { debounceMs: 0 }, syncOnStart: false });
 		collection.insert({ n: 1 });
 		await wait(10);
 		assert.equal(adapter.pushCalls, 1);
@@ -393,7 +396,7 @@ describe("create-sync-engine: pushOnChange", () => {
 	});
 
 	it("does not push automatically when pushOnChange is not enabled", async () => {
-		const collection = makeCollection();
+		const collection = await makeCollection();
 		const adapter = createFakeSyncAdapter<Note>();
 		const engine = createSyncEngine({
 			collection,
@@ -410,7 +413,7 @@ describe("create-sync-engine: pushOnChange", () => {
 
 describe("create-sync-engine: error handling asymmetry", () => {
 	it("a direct pull() call rejects and emits sync:error on failure", async () => {
-		const collection = makeCollection();
+		const collection = await makeCollection();
 		const adapter: SyncAdapter<Note> = {
 			pull: async () => {
 				throw new Error("boom");
@@ -429,7 +432,7 @@ describe("create-sync-engine: error handling asymmetry", () => {
 	});
 
 	it("pushOnChange-triggered failures are swallowed (no unhandled rejection) but still emit sync:error", async () => {
-		const collection = makeCollection();
+		const collection = await makeCollection();
 		const adapter: SyncAdapter<Note> = {
 			pull: async () => ({ records: [] }),
 			push: async () => {
@@ -444,7 +447,7 @@ describe("create-sync-engine: error handling asymmetry", () => {
 		});
 		const errors: unknown[] = [];
 		engine.on("sync:error", (e) => errors.push(e));
-		engine.start({ pushOnChange: true, syncOnStart: false });
+		engine.start({ pushOnChange: { debounceMs: 0 }, syncOnStart: false });
 		collection.insert({ n: 1 });
 		await wait(20);
 		assert.equal(errors.length, 1); // the failure happened, but nothing threw to the caller
@@ -453,7 +456,7 @@ describe("create-sync-engine: error handling asymmetry", () => {
 
 describe("create-sync-engine: start/stop/dispose lifecycle", () => {
 	it("start({ intervalMs }) runs sync periodically until stop()", async () => {
-		const collection = makeCollection();
+		const collection = await makeCollection();
 		let pullCalls = 0;
 		const adapter: SyncAdapter<Note> = {
 			pull: async () => {
@@ -479,7 +482,7 @@ describe("create-sync-engine: start/stop/dispose lifecycle", () => {
 	});
 
 	it("syncOnStart (default true) runs one sync immediately", async () => {
-		const collection = makeCollection();
+		const collection = await makeCollection();
 		const adapter = createFakeSyncAdapter<Note>({ readOnly: true });
 		const engine = createSyncEngine({
 			collection,
@@ -493,7 +496,7 @@ describe("create-sync-engine: start/stop/dispose lifecycle", () => {
 	});
 
 	it("dispose() makes pull/push/sync no-op", async () => {
-		const collection = makeCollection();
+		const collection = await makeCollection();
 		collection.insert({ n: 1 });
 		const adapter = createFakeSyncAdapter<Note>();
 		const engine = createSyncEngine({
@@ -512,7 +515,7 @@ describe("create-sync-engine: start/stop/dispose lifecycle", () => {
 
 describe("create-sync-engine: events", () => {
 	it("emits sync:start, pull:success, and push:success with documented payload shapes", async () => {
-		const collection = makeCollection();
+		const collection = await makeCollection();
 		collection.insert({ n: 1 });
 		const adapter = createFakeSyncAdapter<Note>();
 		const engine = createSyncEngine({

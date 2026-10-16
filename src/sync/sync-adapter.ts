@@ -31,12 +31,38 @@ export interface PullArgs<Filter, Cursor> {
 }
 
 export interface PullResult<T, Cursor> {
-	/** Records to merge locally. Map external data -> envelopes with `source: "remote"`. */
+	/**
+	 * Records to merge locally. The engine normalizes them as remote data (`source: "remote"`,
+	 * `dirty: false`), so the adapter only needs a stable `id`, the `data`, and a `version`
+	 * that increases whenever the remote record changes.
+	 */
 	records: RecordEnvelope<T>[];
 	/** Cursor to pass to the next pull (e.g. a timestamp or page token). */
 	cursor?: Cursor;
-	/** Whether more pages remain right now. */
+	/**
+	 * More pages remain: the engine immediately pulls again with `cursor`, within the same
+	 * `pull()`. The returned `cursor` must change from page to page.
+	 */
 	hasMore?: boolean;
+	/**
+	 * Set on the LAST page of a full snapshot (every record the remote has for this filter).
+	 * Local clean records that weren't in any page of this pull are then removed -- that's how
+	 * remote deletions reach a source that can't report them. Dirty local records are kept.
+	 * Nothing is removed if any page fails. The cursor resets so the next pull starts over.
+	 */
+	complete?: boolean;
+}
+
+export interface PushRejection<T> {
+	mutationId: string;
+	reason: string;
+	/**
+	 * The remote's current copy of the record, if the rejection was a conflict (the remote
+	 * changed since the local edit's `meta.remoteVersion`). The engine resolves it with the
+	 * collection's merge strategy and emits `"conflict"`. Without it, the record is held back
+	 * from automatic pushes until it's edited again.
+	 */
+	record?: RecordEnvelope<T>;
 }
 
 export interface PushResult<T> {
@@ -44,8 +70,8 @@ export interface PushResult<T> {
 	acked: string[];
 	/** Authoritative server records to merge back (optional). */
 	records?: RecordEnvelope<T>[];
-	/** Mutations the remote rejected, with reasons (optional). */
-	rejected?: Array<{ mutationId: string; reason: string }>;
+	/** Mutations the remote rejected (optional). */
+	rejected?: PushRejection<T>[];
 }
 
 export interface SyncAdapter<T, Filter = unknown, Cursor = unknown> {

@@ -6,25 +6,29 @@
  * library provides a few built-in strategies, but you can also implement your own.
  *
  * serverWins() — the remote version always wins (DEFAULT)
- * Remote is authoritative. Local changes are dropped from the record. The mutation
- * queue replays un-acknowledged local writes separately, so they will eventually
- * be re-applied to the remote version.
+ * Remote is authoritative. The conflicting local edit is DISCARDED (the record becomes the
+ * clean remote copy); it is not re-applied later. Listen for the engine's `"conflict"` event
+ * if users should be told, or use a strategy that keeps or combines the local change.
  *
- * lastWriteWins() — the version with the latest `meta.updatedAt` wins
+ * lastWriteWins() — the higher `meta.version` wins, then the later `meta.updatedAt`
  *
  * custom(fn) — you provide a function that takes the local and remote versions and
- * returns the resolved version.
+ * returns the resolved version. Return it with `meta.dirty: true` if the result still needs
+ * pushing (it contains local changes the remote doesn't have yet).
  *
  * Merge is 2-way (local vs remote). Merge is ONLY called on a genuine conflict (both
  * sides exist and both changed); brand-new remote records are inserted without merging.
+ * Whatever the strategy returns, the collection records the remote's version on it
+ * (`meta.remoteVersion`), so a kept local edit is pushed as "based on" what it was merged with.
  *
  * @example
  *   const app = createLocalSyncApp({ merge: serverWins() }); // default
  *   const app = createLocalSyncApp({ merge: lastWriteWins() });
- *   const app = createLocalSyncApp({
+ *   app.collection<Doc>("docs", {
  *     merge: custom((local, remote) => ({
  *       ...remote,
  *       data: { ...remote.data, notes: `${remote.data.notes}\n${local.data.notes}` },
+ *       meta: { ...remote.meta, dirty: true, source: "local" },
  *     })),
  *   });
  *
@@ -77,7 +81,7 @@ export function serverWins<T>(): MergeStrategy<T> {
 	return { merge: (_local, remote) => takeAuthoritative(remote) };
 }
 
-/** Last-write-wins: the record with the latest `meta.updatedAt` wins. */
+/** Last-write-wins: the higher `meta.version` wins, then the later `meta.updatedAt`. */
 export function lastWriteWins<T>(): MergeStrategy<T> {
 	return {
 		merge: (local, remote) =>
