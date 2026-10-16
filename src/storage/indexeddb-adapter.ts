@@ -82,11 +82,23 @@ export function createIndexedDBAdapter(
 	let dbPromise: Promise<IDBDatabase> | undefined;
 	const getDb = (): Promise<IDBDatabase> => {
 		if (dbPromise === undefined) {
-			// A failed open must not be cached forever -- clear it so the next call retries.
-			dbPromise = openDatabase(factory, name, version).catch((err) => {
-				dbPromise = undefined;
-				throw err;
-			});
+			const opening = openDatabase(factory, name, version).then(
+				(db) => {
+					// Another tab (e.g. a newer deploy) needs to upgrade the schema: step aside
+					// rather than block it forever. The next operation here reopens.
+					db.onversionchange = () => {
+						db.close();
+						if (dbPromise === opening) dbPromise = undefined;
+					};
+					return db;
+				},
+				(err) => {
+					// A failed open must not be cached forever -- clear it so the next call retries.
+					if (dbPromise === opening) dbPromise = undefined;
+					throw err;
+				},
+			);
+			dbPromise = opening;
 		}
 		return dbPromise;
 	};
@@ -99,6 +111,47 @@ export function createIndexedDBAdapter(
 			const entry = await promisifyRequest<StoredEntry | undefined>(request);
 			await transactionDone(tx);
 			return entry?.record;
+		},
+
+		async update(collection, ids, decide) {
+			const db = await getDb();
+			// One readwrite transaction: no other connection can write these records between
+			// the read and the write.
+			const tx = db.transaction(STORE, "readwrite");
+			const store = tx.objectStore(STORE);
+			const entries = await Promise.all(
+				ids.map((id) =>
+					promisifyRequest<StoredEntry | undefined>(
+						store.get(compositeKey(collection, id)),
+					),
+				),
+			);
+			const { write, remove } = decide(entries.map((entry) => entry?.record));
+			for (const record of write) {
+				const entry: StoredEntry = {
+					key: compositeKey(collection, record.id),
+					collection,
+					record,
+				};
+				store.put(entry);
+			}
+			for (const id of remove) store.delete(compositeKey(collection, id));
+			await transactionDone(tx);
+		},
+
+		async readMany(collection, ids) {
+			const db = await getDb();
+			const tx = db.transaction(STORE, "readonly");
+			const store = tx.objectStore(STORE);
+			const entries = await Promise.all(
+				ids.map((id) =>
+					promisifyRequest<StoredEntry | undefined>(
+						store.get(compositeKey(collection, id)),
+					),
+				),
+			);
+			await transactionDone(tx);
+			return entries.map((entry) => entry?.record);
 		},
 
 		async readAll(collection) {
@@ -144,6 +197,14 @@ export function createIndexedDBAdapter(
 			const tx = db.transaction(STORE, "readwrite");
 			const store = tx.objectStore(STORE);
 			store.delete(compositeKey(collection, id));
+			await transactionDone(tx);
+		},
+
+		async removeMany(collection, ids) {
+			const db = await getDb();
+			const tx = db.transaction(STORE, "readwrite");
+			const store = tx.objectStore(STORE);
+			for (const id of ids) store.delete(compositeKey(collection, id));
 			await transactionDone(tx);
 		},
 

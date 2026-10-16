@@ -40,8 +40,27 @@ export function createMemoryAdapter(): StorageAdapter {
 			return Promise.resolve();
 		},
 
+		update(collection, ids, decide) {
+			// Synchronous, so nothing else can run between the read and the write.
+			const map = collectionMap(collection);
+			const stored = ids.map((id) => {
+				const record = map.get(id);
+				return record === undefined ? undefined : structuredClone(record);
+			});
+			const { write, remove } = decide(stored);
+			for (const record of write) map.set(record.id, structuredClone(record));
+			for (const id of remove) map.delete(id);
+			return Promise.resolve();
+		},
+
 		remove(collection, id) {
 			collectionMap(collection).delete(id);
+			return Promise.resolve();
+		},
+
+		removeMany(collection, ids) {
+			const map = collectionMap(collection);
+			for (const id of ids) map.delete(id);
 			return Promise.resolve();
 		},
 

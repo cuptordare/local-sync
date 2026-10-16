@@ -140,3 +140,34 @@ test("regression: a failed open is retried, not cached forever (dbPromise fix)",
 	expect(opens.afterFirst).toBe(1);
 	expect(opens.afterSecond).toBe(2); // proves the second call retried instead of reusing a cached rejection
 });
+
+test("update() is atomic: concurrent read-modify-writes from two connections lose nothing", async ({
+	page,
+}) => {
+	const dbName = `atomic-${test.info().testId}`;
+	const count = await page.evaluate(async (databaseName) => {
+		// Two connections, like two tabs of one app.
+		const a = window.__ls.createIndexedDBAdapter({ databaseName });
+		const b = window.__ls.createIndexedDBAdapter({ databaseName });
+		await a.write(
+			"notes",
+			window.__ls.createEnvelope({ count: 0 }, { id: "counter" }),
+		);
+		const increment = (adapter: typeof a) =>
+			adapter.update?.("notes", ["counter"], ([stored]) => ({
+				write: [
+					{
+						...stored,
+						data: { count: (stored.data as { count: number }).count + 1 },
+					},
+				],
+				remove: [],
+			}));
+		await Promise.all(
+			Array.from({ length: 20 }, () => [increment(a), increment(b)]).flat(),
+		);
+		const final = await a.read("notes", "counter");
+		return (final?.data as { count: number } | undefined)?.count;
+	}, dbName);
+	expect(count).toBe(40);
+});
