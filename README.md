@@ -164,6 +164,10 @@ backend needs to:
 Without etags (`read` returns none and `ifMatch` is ignored), two devices saving at exactly
 the same moment can overwrite one save, and nothing notices. Use them.
 
+**Size.** Every read and save moves the whole collection: about 80 characters per key plus
+its value (deletes stay for 30 days). Mind your backend's limit, e.g. a Google Sheets cell
+holds 50,000 characters. Split large data over several stores (each is its own blob).
+
 **How it behaves:**
 
 - Pushes are **debounced** (500 ms by default; `pushDebounceMs`), so typing in a field doesn't
@@ -272,7 +276,7 @@ sync" badge to it:
 // { phase, online, pending, pushScheduled, lastError, lastSyncedAt }
 renderBadge(app.status.get());   // subscribe() only reports changes, so render once first
 app.status.subscribe(renderBadge);
-app.on("error", ({ source, collection, error }) => report(error)); // storage, sync, invalid remote data
+app.on("error", ({ source, collection, error }) => report(error)); // storage, sync, invalid remote data, merge
 await app.sync(); // e.g. a "Retry" button; rejects if anything failed
 ```
 

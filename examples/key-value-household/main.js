@@ -29,9 +29,10 @@ const network = createNetworkStatus(); // follows the browser; the toggle below 
 const app = createLocalSyncApp({ name: `household-demo-${device}`, network });
 
 // 2. A key-value store synced through the server. Every save merges with what's there, per
-//    key, so no one's changes are erased; if two people change the SAME key, the later change
-//    wins on every device. The list uses ONE KEY PER ITEM, so two people ticking off
-//    different items both keep their change (they wouldn't if the whole list were one value).
+//    key, so no one's changes are erased; if two people change the SAME key at once, their
+//    edits are merged field by field, and only a field both changed goes to the later edit.
+//    The list uses ONE KEY PER ITEM, so two people ticking off different items never
+//    interact at all.
 const shopping = app.keyValue("shopping", {
 	remote: createBlobSyncAdapter({
 		read: () => server.read("shopping"),

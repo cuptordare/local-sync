@@ -22,8 +22,9 @@ export function createClient({ label, root, backend }) {
 		}),
 	});
 
-	// Concurrent edits to one note resolve per note: the later edit wins, on every client
-	// (see the README's "Sync semantics"). No merge code to write.
+	// Concurrent edits to one note are merged field by field; where both changed the same
+	// field (here, the text), the later edit wins, on every client (see the README's
+	// "Concurrent edits"). No merge code to write.
 	const notes = app.collection("notes", { validator: noteValidator });
 
 	// Each panel's online toggle is independent of the real browser network, so the demo
