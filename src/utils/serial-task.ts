@@ -39,30 +39,32 @@ export function createSerialTask(
 	let rerunRequested = false;
 
 	const loop = async (): Promise<void> => {
-		do {
-			rerunRequested = false;
-			try {
-				if ((await pass()) === true) rerunRequested = true;
-			} catch (error) {
-				if (rerunRequested) continue;
-				options.onFailure?.(error);
-				throw error;
-			}
-		} while (rerunRequested);
+		try {
+			do {
+				rerunRequested = false;
+				try {
+					if ((await pass()) === true) rerunRequested = true;
+				} catch (error) {
+					if (rerunRequested) continue;
+					options.onFailure?.(error);
+					throw error;
+				}
+			} while (rerunRequested);
+		} finally {
+			// Cleared the moment the last pass ends (in the same step as the final check), so a
+			// call that comes after it starts a new pass instead of joining one that's over.
+			inFlight = undefined;
+		}
 	};
 
 	return {
-		async run() {
+		run() {
 			if (inFlight !== undefined) {
 				rerunRequested = true;
 				return inFlight;
 			}
 			inFlight = loop();
-			try {
-				await inFlight;
-			} finally {
-				inFlight = undefined;
-			}
+			return inFlight;
 		},
 		rerunIfRunning() {
 			if (inFlight !== undefined) rerunRequested = true;

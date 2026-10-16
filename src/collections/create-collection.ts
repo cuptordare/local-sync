@@ -33,6 +33,7 @@ import type { RecordEnvelope } from "../records/record-envelope.js";
 import {
 	createEnvelope,
 	deleteEnvelope,
+	isOwnSaveBefore,
 	markSynced as markRecordSynced,
 	updateEnvelope,
 } from "../records/record-envelope.js";
@@ -444,60 +445,48 @@ export function createCollection<T extends object>(
 		deepEqual(local.data, remote.data);
 
 	/**
-	 * Take a private copy of an incoming remote record, validate it, and normalize its meta:
+	 * Validate an incoming remote record, take a private copy, and normalize its meta:
 	 * whatever the adapter sent, remote data is clean, remote-sourced, and is its own
 	 * remoteVersion. Returns undefined (after reporting) if validation fails.
 	 */
 	const prepareRemote = (
 		incoming: RecordEnvelope<T>,
 	): RecordEnvelope<T> | undefined => {
-		const copy = structuredClone(incoming);
-		let data = copy.data;
-		if (!copy.meta.deleted) {
-			const result = validate(copy.data);
+		let data = incoming.data;
+		if (!incoming.meta.deleted) {
+			const result = validate(incoming.data);
 			if (!result.ok) {
 				handleError(new ValidationError(result.issues), {
 					source: "remote-validation",
 					collection: name,
-					id: copy.id,
+					id: incoming.id,
 				});
 				return undefined;
 			}
 			data = result.value;
 		}
+		// Copied after validation (as local writes are): the collection freezes what it stores,
+		// and neither the adapter's objects nor anything the validator reused may be frozen.
 		return {
-			id: copy.id,
-			data,
+			id: incoming.id,
+			data: structuredClone(data),
 			meta: {
-				...copy.meta,
+				...incoming.meta,
 				source: "remote",
 				dirty: false,
-				remoteVersion: copy.meta.version,
+				remoteVersion: incoming.meta.version,
 			},
 		};
 	};
 
 	/** Resolve a dirty local record against the remote via the merge strategy. */
-	/**
-	 * Whether `remote` is this device's own earlier save that `local` was edited from: saved by
-	 * this device, and older than `local` (on one device, versions only grow along a record's
-	 * history). An older local copy -- e.g. a tab that hasn't heard of the save yet -- isn't.
-	 */
-	const isOwnSaveBefore = (
-		local: RecordEnvelope<T>,
-		remote: RecordEnvelope<T>,
-	): boolean =>
-		deviceId !== undefined &&
-		remote.meta.writer === deviceId &&
-		local.meta.version > remote.meta.version;
-
 	const settleConflict = (
 		local: RecordEnvelope<T>,
 		remote: RecordEnvelope<T>,
 	): RecordEnvelope<T> => {
 		// The remote's copy is this device's own earlier save (e.g. its reply was lost): no
 		// other device has saved since, so the local edit simply builds on it -- no conflict.
-		const merged = isOwnSaveBefore(local, remote)
+		const merged = isOwnSaveBefore(deviceId, local, remote)
 			? local
 			: merge.merge(local, remote);
 		// Whatever the strategy decided, this copy has now seen the remote's version. Without
@@ -524,6 +513,19 @@ export function createCollection<T extends object>(
 			if (!bases.has(incoming.id))
 				bases.set(incoming.id, store.get(incoming.id));
 			const local = store.get(incoming.id);
+			// A synced copy getting a remote copy older than the one it already matches (e.g. from
+			// a pull that read the remote just before a push landed there): out of date, so
+			// ignore it -- applying it would roll back a saved change. (For a copy with local
+			// edits, the merge below decides.)
+			const known = local?.meta.remoteVersion;
+			if (
+				local !== undefined &&
+				!local.meta.dirty &&
+				known !== undefined &&
+				incoming.meta.version < known
+			) {
+				continue;
+			}
 			if (local?.meta.dirty) {
 				// Local has un-pushed edits.
 				if (opts.keepPending) continue; // optimistic: keep the local edit until it is pushed
@@ -590,7 +592,13 @@ export function createCollection<T extends object>(
 		sent: RecordEnvelope<T>,
 	): RecordEnvelope<T> => {
 		const base = edit.meta.remoteVersion;
-		if (!edit.meta.dirty || (base !== undefined && base >= sent.meta.version)) {
+		if (
+			!edit.meta.dirty ||
+			// Only an edit made after `sent` (on one device, versions only grow along a
+			// record's history) -- not an older copy, e.g. from a tab that's behind.
+			edit.meta.version <= sent.meta.version ||
+			(base !== undefined && base >= sent.meta.version)
+		) {
 			return edit;
 		}
 		return {

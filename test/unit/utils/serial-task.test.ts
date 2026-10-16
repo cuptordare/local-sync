@@ -89,4 +89,26 @@ describe("createSerialTask", () => {
 		assert.equal(passes, 2);
 		assert.deepEqual(failures, []);
 	});
+
+	it("a call made just as the last pass finishes still gets a pass of its own", async () => {
+		// Try the call at several points in the microtask queue around the end of the pass.
+		for (let delay = 0; delay < 6; delay++) {
+			let passes = 0;
+			let late: Promise<void> | undefined;
+			const task = createSerialTask(async () => {
+				passes++;
+				if (passes === 1) {
+					let tick = Promise.resolve();
+					for (let i = 0; i < delay; i++) tick = tick.then(() => {});
+					void tick.then(() => {
+						late = task.run();
+					});
+				}
+			});
+			await task.run();
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			await late;
+			assert.equal(passes, 2, `a call ${delay} microtasks in was dropped`);
+		}
+	});
 });

@@ -152,3 +152,21 @@ describe("createBlobSyncAdapter: push", () => {
 		);
 	});
 });
+
+describe("createBlobSyncAdapter: versions never go backwards", () => {
+	it("a re-sent older copy with the same content is acked without overwriting, and the newer copy returned", async () => {
+		const server = createFakeBlobServer<V>();
+		server.put([rec("k", "same", { version: 2 })]);
+		const adapter = createBlobSyncAdapter(server);
+		const stale = rec("k", "same", {
+			version: 1,
+			dirty: true,
+			source: "local",
+		});
+		const result = await adapter.push?.([mutation(stale)]);
+		assert.deepEqual(result?.acked, ["m1"]);
+		assert.equal(server.records[0]?.meta.version, 2);
+		assert.equal(server.writes, 0);
+		assert.equal(result?.records?.[0]?.meta.version, 2);
+	});
+});

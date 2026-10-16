@@ -3,6 +3,7 @@ import { createEventBus } from "../events/event-bus.js";
 import type { Listener, Unsubscribe } from "../events/event-types.js";
 import type { NetworkStatus } from "../network/network-status.js";
 import type { RecordEnvelope } from "../records/record-envelope.js";
+import { isOwnSaveBefore } from "../records/record-envelope.js";
 import { deepEqual } from "../utils/deep-equal.js";
 import { createSerialTask } from "../utils/serial-task.js";
 import { now as defaultNow } from "../utils/timestamps.js";
@@ -112,7 +113,8 @@ export function createSyncEngine<
 
 	// --- core operations (no status/event bookkeeping; that's added by the wrapper) ---
 
-	const runPull = async (): Promise<void> => {
+	/** Returns false if the pull was abandoned (disposed, or the filter changed meanwhile). */
+	const runPull = async (): Promise<boolean> => {
 		if (!collection.hydrated) await collection.load();
 		// Records a snapshot must keep: those in any page, plus any changed during the pull by
 		// something else (e.g. a push acked between pages) -- earlier pages predate that change,
@@ -122,13 +124,13 @@ export function createSyncEngine<
 			for (const change of changes) seen.add(change.id);
 		});
 		try {
-			await pullPages(seen);
+			return await pullPages(seen);
 		} finally {
 			stopWatching();
 		}
 	};
 
-	const pullPages = async (seen: Set<string>): Promise<void> => {
+	const pullPages = async (seen: Set<string>): Promise<boolean> => {
 		const generation = filterGeneration;
 		const startCursor = cursor;
 		let pageCursor = startCursor;
@@ -140,10 +142,10 @@ export function createSyncEngine<
 			if (filter !== undefined) args.filter = filter;
 			if (pageCursor !== undefined) args.cursor = pageCursor;
 			const result = await withRetry(() => adapter.pull(args), retry, sleep);
-			if (disposed) return;
+			if (disposed) return false;
 			// The filter changed while this page was loading: these results are for the old
 			// filter, so drop them (setFilter queued a fresh pull for the new one).
-			if (generation !== filterGeneration) return;
+			if (generation !== filterGeneration) return false;
 			// Pull preserves un-pushed local edits (optimistic-until-acknowledged) when enabled.
 			collection.applyRemote(result.records, {
 				keepPending: keepPendingOnPull,
@@ -175,6 +177,7 @@ export function createSyncEngine<
 		if (complete) collection.removeUnseen(seen);
 		cursor = complete ? undefined : (lastCursor ?? startCursor);
 		events.emit("pull:success", { count });
+		return true;
 	};
 
 	/** Returns true if a conflict was resolved into a local edit that should be pushed again. */
@@ -195,6 +198,7 @@ export function createSyncEngine<
 		// Only records that are still exactly what was pushed may take the server's response
 		// or be marked synced; applying it to anything newer would overwrite that change
 		// (e.g. resurrecting a record the user deleted during the round-trip).
+		const byMutationId = new Map(mutations.map((m) => [m.mutationId, m]));
 		// Re-checked after each step below, since each step changes records.
 		let pendingNow = new Map<string, RecordEnvelope<T>>();
 		const recheck = (): void => {
@@ -205,7 +209,18 @@ export function createSyncEngine<
 			return p !== undefined && p === pushedRecords.get(id);
 		};
 		recheck();
-		const freshRecords = (result.records ?? []).filter((r) => unchanged(r.id));
+		// A returned copy of a REJECTED record is handled with the rejection (below), not
+		// applied here -- applying it first would change the record and skip the rejection.
+		const rejectedIds = new Set(
+			(result.rejected ?? []).flatMap((r) => {
+				const m = byMutationId.get(r.mutationId);
+				return m === undefined ? [] : [m.recordId];
+			}),
+		);
+		const returned = new Map((result.records ?? []).map((r) => [r.id, r]));
+		const freshRecords = (result.records ?? []).filter(
+			(r) => unchanged(r.id) && !rejectedIds.has(r.id),
+		);
 
 		// Acks first: an acknowledged record is then clean, so the server's copy of it (below)
 		// simply replaces it, rather than being "merged" with the very edit it accepted.
@@ -218,25 +233,22 @@ export function createSyncEngine<
 		recheck();
 
 		let repush = false;
-		const byMutationId = new Map(mutations.map((m) => [m.mutationId, m]));
 		for (const rejection of result.rejected ?? []) {
 			const mutation = byMutationId.get(rejection.mutationId);
 			if (mutation === undefined || !unchanged(mutation.recordId)) continue;
 			const id = mutation.recordId;
+			const current = rejection.record ?? returned.get(id);
 			const conflicts = (conflictCounts.get(id) ?? 0) + 1;
-			if (
-				rejection.record !== undefined &&
-				conflicts <= MAX_CONSECUTIVE_CONFLICTS
-			) {
+			if (current !== undefined && conflicts <= MAX_CONSECUTIVE_CONFLICTS) {
 				conflictCounts.set(id, conflicts);
-				collection.applyRemote([{ ...rejection.record, id }]);
-				// The remote's copy is this device's own earlier save that this edit came after
-				// (e.g. its reply was lost): the collection builds on it, and it's no conflict
-				// worth reporting. (Same test as the collection's.)
-				const ownSave =
-					rejection.record.meta.writer !== undefined &&
-					rejection.record.meta.writer === collection.deviceId &&
-					mutation.record.meta.version > rejection.record.meta.version;
+				collection.applyRemote([{ ...current, id }]);
+				// This device's own earlier save (e.g. its reply was lost): the collection
+				// builds on it, and it's no conflict worth reporting.
+				const ownSave = isOwnSaveBefore(
+					collection.deviceId,
+					mutation.record,
+					current,
+				);
 				if (!ownSave) events.emit("conflict", { id, reason: rejection.reason });
 				repush = true;
 			} else {
@@ -301,8 +313,9 @@ export function createSyncEngine<
 			const startedAt = clock();
 			events.emit("sync:start", { direction: "pull" });
 			markBusy();
-			await runPull();
-			succeed("pull", startedAt);
+			if (await runPull()) succeed("pull", startedAt);
+			// Abandoned: nothing was synced, so no success to record (or failure to clear).
+			else publishOutcome();
 		},
 		{ onFailure: (err) => reportFailure("pull", err) },
 	);

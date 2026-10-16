@@ -91,6 +91,10 @@ function toBlobRecord<T>(record: RecordEnvelope<T>): RecordEnvelope<T> {
 	};
 }
 
+function sameContent<T>(a: RecordEnvelope<T>, b: RecordEnvelope<T>): boolean {
+	return deepEqual(a.data, b.data) && a.meta.deleted === b.meta.deleted;
+}
+
 /**
  * Whether the remote changed this record since the local edit's base. Records written before
  * `remoteVersion` existed have no base; for those, the edit is accepted only if it is ahead of
@@ -100,12 +104,7 @@ function isStale<T>(
 	local: RecordEnvelope<T>,
 	remote: RecordEnvelope<T>,
 ): boolean {
-	if (
-		deepEqual(local.data, remote.data) &&
-		local.meta.deleted === remote.meta.deleted
-	) {
-		return false; // same content: nothing to lose
-	}
+	if (sameContent(local, remote)) return false; // nothing to lose
 	const base = local.meta.remoteVersion;
 	return base === undefined
 		? local.meta.version <= remote.meta.version
@@ -145,6 +144,10 @@ export function createBlobSyncAdapter<T>(
 				const current = new Map(records.map((r) => [r.id, r]));
 				const acked: string[] = [];
 				const rejected: PushRejection<T>[] = [];
+				// Acked without a write: the remote already has this content, at this version or
+				// a later one. Its copy goes back, so the client takes its (later) version.
+				const alreadyThere: RecordEnvelope<T>[] = [];
+				let changed = false;
 
 				for (const mutation of mutations) {
 					const remote = current.get(mutation.recordId);
@@ -157,16 +160,31 @@ export function createBlobSyncAdapter<T>(
 						});
 						continue;
 					}
-					current.set(mutation.recordId, toBlobRecord(mutation.record));
 					acked.push(mutation.mutationId);
+					if (
+						remote !== undefined &&
+						sameContent(mutation.record, remote) &&
+						remote.meta.version >= mutation.record.meta.version
+					) {
+						// Never move the remote's version backwards (e.g. a stale copy re-sent).
+						alreadyThere.push(remote);
+						continue;
+					}
+					current.set(mutation.recordId, toBlobRecord(mutation.record));
+					changed = true;
 				}
 
-				if (acked.length === 0) return { acked, rejected };
+				const response: PushResult<T> = {
+					acked,
+					rejected,
+					...(alreadyThere.length > 0 ? { records: alreadyThere } : {}),
+				};
+				if (!changed) return response;
 				const result = await options.write(
 					{ records: [...current.values()] },
 					etag === undefined ? {} : { ifMatch: etag },
 				);
-				if (result?.conflict !== true) return { acked, rejected };
+				if (result?.conflict !== true) return response;
 				if (attempt >= maxConflictRetries) {
 					throw new Error(
 						`Blob write kept conflicting after ${maxConflictRetries + 1} attempts (it is being changed concurrently)`,

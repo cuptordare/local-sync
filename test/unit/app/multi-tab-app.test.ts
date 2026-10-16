@@ -390,3 +390,23 @@ describe("multi-tab: shared storage races", () => {
 		assert.equal((stored?.data as Item | undefined)?.text, "edited in B");
 	});
 });
+
+describe("multi-tab: acknowledgements and older copies", () => {
+	it("an ack doesn't stamp an older copy (e.g. a tab that's behind) with the newer accepted version", async () => {
+		const items = createCollection<Item>({
+			name: "items",
+			storage: createStorageEngine(createMemoryAdapter()),
+		});
+		await items.ready;
+		items.insert({ text: "v1" }, { id: "k" });
+		const older = items.peek("k");
+		assert.ok(older);
+		// Another tab pushed a later version (v2) of this record, and it was accepted.
+		const sent = { ...older, meta: { ...older.meta, version: 2 } };
+		items.acknowledge([sent]);
+		const after = items.peek("k");
+		assert.equal(after?.meta.version, 1);
+		assert.equal(after?.meta.remoteVersion, undefined, "v1 isn't based on v2");
+		assert.equal(after?.meta.dirty, true);
+	});
+});

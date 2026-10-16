@@ -399,3 +399,17 @@ describe("collection safety: loading edge cases", () => {
 		assert.deepEqual(await inner.readAll("notes"), []);
 	});
 });
+
+describe("collection safety: validator output from remote data", () => {
+	it("isn't frozen in place, so a validator may reuse shared objects (e.g. defaults)", async () => {
+		const DEFAULT_TAGS: string[] = [];
+		const notes = makeCollection({
+			validator: (d) => valid({ ...(d as Note), tags: DEFAULT_TAGS }),
+		});
+		await notes.ready;
+		notes.applyRemote([remote("r", { text: "from the server" })]);
+		assert.equal(Object.isFrozen(notes.peek("r")?.data.tags), true); // stored copy: frozen
+		assert.equal(Object.isFrozen(DEFAULT_TAGS), false); // the validator's own: untouched
+		DEFAULT_TAGS.push("still usable");
+	});
+});

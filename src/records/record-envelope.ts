@@ -175,3 +175,21 @@ export function markDirty<T>(envelope: RecordEnvelope<T>): RecordEnvelope<T> {
 export function isTombstone(envelope: RecordEnvelope<unknown>): boolean {
 	return envelope.meta.deleted;
 }
+
+/**
+ * Whether `remote` is the device `deviceId`'s own earlier save that `local` was edited from:
+ * saved by that device, and older than `local` (on one device, versions only grow along a
+ * record's history). An older local copy -- e.g. a tab that hasn't heard of the save yet --
+ * isn't. Such a save is no conflict: the local edit simply builds on it.
+ */
+export function isOwnSaveBefore<T>(
+	deviceId: string | undefined,
+	local: RecordEnvelope<T>,
+	remote: RecordEnvelope<T>,
+): boolean {
+	return (
+		deviceId !== undefined &&
+		remote.meta.writer === deviceId &&
+		local.meta.version > remote.meta.version
+	);
+}

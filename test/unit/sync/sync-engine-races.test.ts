@@ -13,6 +13,7 @@ import type {
 } from "../../../src/sync/sync-adapter.js";
 import { createFakeBlobServer } from "../support/fake-blob-server.js";
 import { createInstantSleep } from "../support/fake-clock.js";
+import { createFakeNetworkStatus } from "../support/fake-network-status.js";
 import { createDeferred } from "../support/fake-sync-adapter.js";
 
 interface Item {
@@ -454,5 +455,128 @@ describe("sync engine: lost replies", () => {
 
 		assert.deepEqual(server.records[0]?.data, { n: 2 });
 		assert.equal(b.collection.peek("x")?.data.n, 2);
+	});
+});
+
+describe("sync engine: overlapping pull and push", () => {
+	it("a pull that read the remote before a push landed doesn't roll the saved record back", async () => {
+		const collection = await makeCollection();
+		const server = new Map<string, RecordEnvelope<Item>>();
+		const pullArrives = createDeferred<void>();
+		let delayPull = false;
+		const engine = createSyncEngine<Item>({
+			collection,
+			sleep: createInstantSleep(),
+			adapter: {
+				async pull() {
+					const snapshot = structuredClone([...server.values()]); // read now...
+					if (delayPull) await pullArrives.promise; // ...arrive later
+					return { records: snapshot };
+				},
+				async push(mutations) {
+					for (const m of mutations) {
+						server.set(m.recordId, structuredClone(m.record));
+					}
+					return { acked: mutations.map((m) => m.mutationId) };
+				},
+			},
+		});
+		collection.insert({ n: 1 }, { id: "x" });
+		await engine.push();
+		collection.update("x", { n: 2 });
+		delayPull = true;
+		const pulling = engine.pull(); // e.g. an interval refresh: reads n=1
+		await wait(5);
+		await engine.push(); // meanwhile, the auto-push saves n=2
+		pullArrives.resolve();
+		await pulling;
+
+		assert.equal(collection.peek("x")?.data.n, 2);
+		assert.equal(collection.peek("x")?.meta.remoteVersion, 2);
+	});
+});
+
+describe("sync engine: rejected records returned in the response", () => {
+	it("are handled as the rejection's conflict, not merged silently beforehand", async () => {
+		const collection = createCollection<Item>({
+			name: "items",
+			storage: createStorageEngine(createMemoryAdapter()),
+			merge: lastWriteWins<Item>(),
+		});
+		await collection.ready;
+		collection.insert({ n: 1 }, { id: "x", now: 1000 });
+		const serverCopy: RecordEnvelope<Item> = {
+			...rec("x", 9),
+			meta: { ...rec("x").meta, updatedAt: 1 }, // older than the local edit
+		};
+		let pushes = 0;
+		const engine = createSyncEngine<Item>({
+			collection,
+			sleep: createInstantSleep(),
+			adapter: {
+				pull: async () => ({ records: [] }),
+				async push(mutations): Promise<PushResult<Item>> {
+					pushes++;
+					if (pushes > 1) return { acked: mutations.map((m) => m.mutationId) };
+					// Rejected -- with the server's copy in `records`, not on the rejection.
+					return {
+						acked: [],
+						rejected: mutations.map((m) => ({
+							mutationId: m.mutationId,
+							reason: "stale",
+						})),
+						records: [serverCopy],
+					};
+				},
+			},
+		});
+		const conflicts: string[] = [];
+		engine.on("conflict", (e) => conflicts.push(e.id));
+		await engine.push();
+
+		assert.deepEqual(conflicts, ["x"]);
+		assert.equal(pushes, 2, "the kept local edit is pushed again");
+		assert.equal(collection.peek("x")?.data.n, 1);
+		assert.equal(collection.peek("x")?.meta.dirty, false);
+	});
+});
+
+describe("sync engine: abandoned pulls", () => {
+	it("a pull abandoned by a filter change isn't reported as a successful sync", async () => {
+		const collection = await makeCollection();
+		const network = createFakeNetworkStatus(true);
+		const slowPull = createDeferred<void>();
+		let fail = true;
+		const engine = createSyncEngine<Item, string>({
+			collection,
+			network,
+			filter: "old",
+			retry: { maxAttempts: 1 },
+			sleep: createInstantSleep(),
+			adapter: {
+				async pull() {
+					if (fail) throw new Error("HTTP 500");
+					await slowPull.promise;
+					return { records: [rec("a")] };
+				},
+			},
+		});
+		await assert.rejects(engine.pull(), /HTTP 500/);
+		assert.equal(engine.getState().phase, "error");
+
+		fail = false;
+		const pulling = engine.pull();
+		await wait(5);
+		engine.setFilter("new"); // the running pull's results no longer apply...
+		network.set(false); // ...and the pull for the new filter can't run yet
+		slowPull.resolve();
+		await pulling;
+
+		assert.equal(
+			engine.getState().phase,
+			"error",
+			"nothing has synced since the failure",
+		);
+		assert.equal(engine.getState().lastSyncedAt, undefined);
 	});
 });
