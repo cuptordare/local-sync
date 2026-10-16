@@ -1,19 +1,18 @@
 /**
  * Internal runtime state shared by an app's methods (not part of the public API).
- * Holds the storage engine, the default merge strategy, the clock, the collection
- * registry, and the app event bus. `create-local-sync-app` is the public facade over this.
+ * Holds the storage adapter, this tab's clock and writer id, the collection registry, and
+ * the app event bus. `create-local-sync-app` is the public facade over this.
  */
 
 import type { Collection } from "../collections/collection-types.js";
+import type { HybridClock } from "../crdt/hlc.js";
+import { createHybridClock } from "../crdt/hlc.js";
 import type { EventBus } from "../events/event-bus.js";
 import { createEventBus } from "../events/event-bus.js";
-import type { MergeFactory, MergeStrategy } from "../records/record-merge.js";
-import { serverWins } from "../records/record-merge.js";
+import { loadWriterId } from "../storage/device-id.js";
 import { createIndexedDBAdapter } from "../storage/indexeddb-adapter.js";
 import { createMemoryAdapter } from "../storage/memory-adapter.js";
 import type { StorageAdapter } from "../storage/storage-adapter.js";
-import type { StorageEngine } from "../storage/storage-engine.js";
-import { createStorageEngine } from "../storage/storage-engine.js";
 import type { SyncEngine, SyncStartOptions } from "../sync/sync-engine.js";
 import { logBackgroundError } from "../utils/log-error.js";
 import { now as defaultNow } from "../utils/timestamps.js";
@@ -38,9 +37,13 @@ export interface Registration {
 }
 
 export interface LocalSyncAppContext {
-	readonly storage: StorageEngine;
-	readonly mergeFactory: MergeFactory;
-	readonly clock: () => number;
+	readonly storage: StorageAdapter;
+	/** Wall clock (epoch ms), for status timestamps. */
+	readonly now: () => number;
+	/** This tab's hybrid clock, which every write is stamped with. */
+	readonly clock: HybridClock;
+	/** The `device` this tab writes as (loaded once, retried if loading failed). */
+	readonly writerId: () => Promise<string>;
 	/** Report a background error: emits the app "error" event and calls the configured handler. */
 	readonly report: (event: LocalSyncErrorEvent) => void;
 	/** Registered collections, keyed by name. Stored type-erased; cast on retrieval. */
@@ -52,7 +55,6 @@ export interface LocalSyncAppContext {
 export interface LocalSyncAppContextOptions {
 	name?: string;
 	storage?: StorageAdapter;
-	merge?: MergeFactory | MergeStrategy<unknown>;
 	now?: () => number;
 	onError?: (error: unknown, info: Omit<LocalSyncErrorEvent, "error">) => void;
 }
@@ -75,16 +77,6 @@ function chooseStorage(options: LocalSyncAppContextOptions): StorageAdapter {
 	return createMemoryAdapter();
 }
 
-function toMergeFactory(
-	merge: MergeFactory | MergeStrategy<unknown> | undefined,
-): MergeFactory {
-	if (merge === undefined) return serverWins;
-	if (typeof merge === "function") return merge;
-	// A strategy instance (e.g. `lastWriteWins()`): the built-ins are type-agnostic, so the
-	// same instance can serve every collection.
-	return <T>() => merge as unknown as MergeStrategy<T>;
-}
-
 export function createLocalSyncAppContext(
 	options: LocalSyncAppContextOptions = {},
 ): LocalSyncAppContext {
@@ -98,10 +90,23 @@ export function createLocalSyncAppContext(
 			logBackgroundError(event.error, event);
 		}
 	};
+	const storage = chooseStorage(options);
+	const now = options.now ?? defaultNow;
+	let writer: Promise<string> | undefined;
 	return {
-		storage: createStorageEngine(chooseStorage(options)),
-		mergeFactory: toMergeFactory(options.merge),
-		clock: options.now ?? defaultNow,
+		storage,
+		now,
+		clock: createHybridClock(now),
+		writerId() {
+			if (writer === undefined) {
+				const loading = loadWriterId(storage);
+				writer = loading;
+				loading.catch(() => {
+					if (writer === loading) writer = undefined; // retried by the next caller
+				});
+			}
+			return writer;
+		},
 		report,
 		registry: new Map(),
 		events,

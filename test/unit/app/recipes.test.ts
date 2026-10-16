@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { LocalSyncErrorEvent } from "../../../src/app/app-events.js";
 import { createLocalSyncApp } from "../../../src/app/create-local-sync-app.js";
-import { lastWriteWins } from "../../../src/records/record-merge.js";
 import { createMemoryAdapter } from "../../../src/storage/memory-adapter.js";
 import type { StorageAdapter } from "../../../src/storage/storage-adapter.js";
 import { createBlobSyncAdapter } from "../../../src/sync/adapters/blob-sync-adapter.js";
@@ -17,8 +16,12 @@ interface Todo {
 const wait = (ms = 10) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** A client app sharing `server` (fast, deterministic sync settings). */
-function client(server: ReturnType<typeof createFakeBlobServer<Todo>>) {
+function client(
+	server: ReturnType<typeof createFakeBlobServer<Todo>>,
+	now?: () => number,
+) {
 	const app = createLocalSyncApp({
+		...(now !== undefined ? { now } : {}),
 		network: createFakeNetworkStatus(true),
 		onError: () => {},
 	});
@@ -54,8 +57,9 @@ describe("app.keyValue: local behavior", () => {
 		await app.ready();
 		todos.update("shared", (t) => ({ items: [...t.items, "milk"] }));
 		assert.deepEqual(todos.get("shared"), { items: ["milk"] });
+		const before = todos.collection.peek("shared");
 		todos.set("shared", { items: ["milk"] }); // unchanged -> no-op
-		assert.equal(todos.collection.peek("shared")?.meta.version, 1);
+		assert.equal(todos.collection.peek("shared"), before);
 		assert.deepEqual(todos.entries(), [["shared", { items: ["milk"] }]]);
 		todos.delete("shared");
 		assert.deepEqual(todos.get("shared"), { items: [] });
@@ -88,7 +92,7 @@ describe("app.keyValue: local behavior", () => {
 		const seen: string[][] = [];
 		todos.watch("shared", (t) => seen.push([...t.items]));
 		todos.set("shared", { items: ["a"] });
-		todos.collection.markSynced(["shared"]); // metadata-only change: not reported
+		todos.collection.mergeRemote(todos.collection.snapshot(), { synced: true }); // bookkeeping only: not reported
 		todos.set("shared", { items: ["a", "b"] });
 		assert.deepEqual(seen, [[], ["a"], ["a", "b"]]);
 	});
@@ -120,11 +124,11 @@ describe("app.keyValue: watchAll", () => {
 		todos.set("a", { items: ["x"] });
 		const seen: Array<Array<[string, Todo]>> = [];
 		todos.watchAll((values) => seen.push([...values]), { immediate: false });
-		todos.collection.markSynced(["a"]); // metadata only
+		todos.collection.mergeRemote(todos.collection.snapshot(), { synced: true }); // bookkeeping only
 		todos.set("a", { items: ["x"] }); // unchanged value
 		todos.set("b", { items: ["y"] });
 		todos.delete("a");
-		todos.collection.purgeDeleted(); // removing a tombstone changes no value
+		todos.collection.mergeRemote(todos.collection.snapshot(), { synced: true }); // the delete synced: no value change
 		assert.deepEqual(seen, [
 			[
 				["a", { items: ["x"] }],
@@ -149,36 +153,53 @@ describe("app.keyValue: syncing between clients", () => {
 		await Promise.all([a.app.close(), b.app.close()]);
 	});
 
-	it("concurrent edits to the same key are detected, not silently lost", async () => {
-		const server = createFakeBlobServer<Todo>();
+	it("concurrent edits to the same key converge on the later write, everywhere", async () => {
+		const server = createFakeBlobServer<Todo>({ cas: true });
 		const a = client(server);
 		const b = client(server);
 		await Promise.all([a.app.ready(), b.app.ready()]);
 		a.todos.set("shared", { items: ["base"] });
 		await wait();
 		await b.app.sync(); // both now have "base"
-		const conflicts: string[] = [];
-		b.app.on("conflict", (e) => conflicts.push(`${e.collection}/${e.id}`));
 
-		b.app.engine("todos")?.stop(); // hold B's push back so A can win the race
+		b.app.engine("todos")?.stop(); // hold B's push back, so A saves first
 		a.todos.set("shared", { items: ["base", "from A"] });
-		b.todos.set("shared", { items: ["base", "from B"] });
+		await wait(5);
+		b.todos.set("shared", { items: ["base", "from B"] }); // later, without seeing A's
 		await wait();
 		await b.app.sync();
+		await a.app.sync();
 
-		assert.deepEqual(conflicts, ["todos/shared"]);
-		// Default serverWins: B now shows A's saved value instead of silently overwriting it.
-		assert.deepEqual(b.todos.get("shared"), { items: ["base", "from A"] });
-		assert.deepEqual(server.records[0]?.data, { items: ["base", "from A"] });
+		for (const value of [a.todos.get("shared"), b.todos.get("shared")]) {
+			assert.deepEqual(value, { items: ["base", "from B"] });
+		}
+		assert.deepEqual(server.values().get("shared"), {
+			items: ["base", "from B"],
+		});
 		await Promise.all([a.app.close(), b.app.close()]);
+	});
+
+	it("an edit made after seeing another device's write wins, even with a slow clock", async () => {
+		const server = createFakeBlobServer<Todo>({ cas: true });
+		const fast = client(server);
+		const slow = client(server, () => Date.now() - 60 * 60_000); // an hour behind
+		await Promise.all([fast.app.ready(), slow.app.ready()]);
+		fast.todos.set("shared", { items: ["fast"] });
+		await wait();
+		await slow.app.sync();
+		slow.todos.set("shared", { items: ["fast", "then slow"] });
+		await wait();
+		await fast.app.sync();
+		assert.deepEqual(fast.todos.get("shared"), {
+			items: ["fast", "then slow"],
+		});
+		await Promise.all([fast.app.close(), slow.app.close()]);
 	});
 
 	it("a key can be set again after its deletion has synced", async () => {
 		const server = createFakeBlobServer<Todo>();
 		const { app, todos } = client(server);
 		await app.ready();
-		const conflicts: string[] = [];
-		app.on("conflict", (e) => conflicts.push(e.id));
 		await wait(); // initial sync
 		// Push-on-change only (no polling): nothing pulls between these edits.
 		todos.set("k", { items: ["first"] });
@@ -187,29 +208,20 @@ describe("app.keyValue: syncing between clients", () => {
 		await wait();
 		todos.set("k", { items: ["second"] });
 		await wait();
-		assert.deepEqual(conflicts, []);
 		assert.deepEqual(todos.get("k"), { items: ["second"] });
-		assert.deepEqual(server.records[0]?.data, { items: ["second"] });
+		assert.deepEqual(server.values().get("k"), { items: ["second"] });
 		await app.close();
 	});
 
 	it("a synced deletion isn't rewritten to storage on every later sync", async () => {
 		const server = createFakeBlobServer<Todo>();
 		const inner = createMemoryAdapter();
-		let writes = 0; // storage writes/removes touching the deleted key
+		let writes = 0; // storage writes touching the deleted key
 		const storage: StorageAdapter = {
 			...inner,
-			async write(collection, record) {
-				if (record.id === "k") writes++;
-				await inner.write(collection, record);
-			},
-			async writeMany(collection, records) {
-				if (records.some((r) => r.id === "k")) writes++;
-				await inner.writeMany(collection, records);
-			},
-			async remove(collection, id) {
-				if (id === "k") writes++;
-				await inner.remove(collection, id);
+			merge(collection, changes) {
+				if (changes.has("k")) writes++;
+				return inner.merge(collection, changes);
 			},
 		};
 		const app = createLocalSyncApp({
@@ -243,15 +255,11 @@ describe("app.keyValue: syncing between clients", () => {
 		const events: string[] = [];
 		const storage: StorageAdapter = {
 			...inner,
-			async write(collection, record) {
+			async merge(collection, changes) {
 				await wait(20);
-				await inner.write(collection, record);
-				events.push("write");
-			},
-			async writeMany(collection, records) {
-				await wait(20);
-				await inner.writeMany(collection, records);
-				events.push("write");
+				const result = await inner.merge(collection, changes);
+				if (collection === "todos") events.push("write");
+				return result;
 			},
 			async close() {
 				events.push("close");
@@ -279,7 +287,7 @@ describe("app.keyValue: syncing between clients", () => {
 		todos.set("shared", { items: ["late"] });
 		assert.equal(app.status.get().pushScheduled, true);
 		await app.close();
-		assert.deepEqual(server.records[0]?.data, { items: ["late"] });
+		assert.deepEqual(server.values().get("shared"), { items: ["late"] });
 	});
 });
 
@@ -335,7 +343,7 @@ describe("app.source", () => {
 		await app.close();
 	});
 
-	it("unchanged items keep their version, so a refresh doesn't wake watchers", async () => {
+	it("unchanged items keep their entry, so a refresh doesn't wake watchers", async () => {
 		const api = fakeApi([[{ key: "A-1", title: "one" }]]);
 		const app = createLocalSyncApp({ network: createFakeNetworkStatus(true) });
 		const issues = app.source<Issue, unknown, number>("issues", {
@@ -343,11 +351,12 @@ describe("app.source", () => {
 			getId: (i) => i.key,
 		});
 		await wait();
+		const before = issues.collection.peek("A-1");
 		let notified = 0;
 		issues.query().subscribe(() => notified++);
 		await issues.refresh();
 		assert.equal(notified, 0);
-		assert.equal(issues.collection.peek("A-1")?.meta.version, 1);
+		assert.equal(issues.collection.peek("A-1"), before);
 		await app.close();
 	});
 
@@ -444,7 +453,7 @@ describe("app-level sync, status, and options", () => {
 		});
 		app.keyValue<Todo>("todos", {
 			remote: {
-				pull: async () => {
+				read: async () => {
 					throw new Error("down");
 				},
 			},
@@ -455,33 +464,10 @@ describe("app-level sync, status, and options", () => {
 		await app.close();
 	});
 
-	it("accepts a merge strategy instance as the app default", async () => {
-		const app = createLocalSyncApp({ merge: lastWriteWins() });
-		const todos = app.collection<Todo>("todos");
-		await app.ready();
-		todos.insert({ items: [] }, { id: "k" });
-		todos.update("k", { items: ["local"] });
-		todos.applyRemote([
-			{
-				id: "k",
-				data: { items: ["remote"] },
-				meta: {
-					version: 1,
-					createdAt: 0,
-					updatedAt: 0,
-					deleted: false,
-					dirty: false,
-					source: "remote",
-				},
-			},
-		]);
-		assert.deepEqual(todos.peek("k")?.data, { items: ["local"] }); // local v2 > remote v1
-	});
-
 	it("background storage errors are reported as app error events", async () => {
 		const failing: StorageAdapter = {
 			...createMemoryAdapter(),
-			write: async () => {
+			merge: async () => {
 				throw new Error("quota exceeded");
 			},
 		};
@@ -516,7 +502,7 @@ describe("recipes: review regressions", () => {
 		todos.delete("shared"); // fine once loaded
 	});
 
-	it("a source with a transforming validator keeps unchanged items' versions across refreshes", async () => {
+	it("a source with a transforming validator keeps unchanged items' entries across refreshes", async () => {
 		const app = createLocalSyncApp({ network: createFakeNetworkStatus(true) });
 		const issues = app.source<Issue>("issues", {
 			fetchPage: async () => ({ items: [{ key: "A-1", title: "  one  " }] }),
@@ -527,11 +513,12 @@ describe("recipes: review regressions", () => {
 			},
 		});
 		await issues.refresh();
+		const first = issues.collection.peek("A-1");
 		await issues.refresh();
 		await issues.refresh();
 		const record = issues.collection.peek("A-1");
 		assert.equal(record?.data.title, "one");
-		assert.equal(record?.meta.version, 1);
+		assert.equal(record, first);
 		await app.close();
 	});
 });

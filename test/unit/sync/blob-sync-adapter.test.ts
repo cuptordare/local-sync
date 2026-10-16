@@ -1,172 +1,145 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import type { RecordEnvelope } from "../../../src/records/record-envelope.js";
+import type { Entry } from "../../../src/crdt/lww-map.js";
+import type { BlobSnapshot } from "../../../src/sync/adapters/blob-sync-adapter.js";
 import { createBlobSyncAdapter } from "../../../src/sync/adapters/blob-sync-adapter.js";
-import type { Mutation } from "../../../src/sync/sync-adapter.js";
-import { createFakeBlobServer } from "../support/fake-blob-server.js";
 
 interface V {
 	v: string;
 }
 
-function rec(
-	id: string,
-	v: string,
-	meta: Partial<RecordEnvelope<V>["meta"]> = {},
-): RecordEnvelope<V> {
-	return {
-		id,
-		data: { v },
-		meta: {
-			version: 1,
-			createdAt: 0,
-			updatedAt: 0,
-			deleted: false,
-			dirty: false,
-			source: "remote",
-			...meta,
-		},
-	};
-}
-
-const mutation = (record: RecordEnvelope<V>, n = 1): Mutation<V> => ({
-	mutationId: `m${n}`,
-	collection: "c",
-	recordId: record.id,
-	record,
+const entry = (v: string, stamp = 5): Entry<V> => ({
+	value: { v },
+	deleted: false,
+	stamp,
+	device: "d1.t1",
 });
 
-describe("createBlobSyncAdapter: pull", () => {
-	it("treats a missing blob as empty, and accepts a bare array of records", async () => {
-		assert.deepEqual(
-			await createBlobSyncAdapter<V>({
-				read: async () => null,
-				write: async () => {},
-			}).pull({}),
-			{ records: [] },
-		);
-		const bare = createBlobSyncAdapter<V>({
-			read: async () => [rec("a", "1")],
-			write: async () => {},
+const reading = (raw: unknown, legacy?: unknown) =>
+	createBlobSyncAdapter<V>({
+		read: async () => raw as BlobSnapshot<V>,
+		write: async () => {},
+		...(legacy !== undefined ? { legacy: { read: async () => legacy } } : {}),
+	});
+
+describe("createBlobSyncAdapter: read", () => {
+	it("treats a missing document as empty, keeping its etag", async () => {
+		assert.deepEqual(await reading(null).read(), { entries: new Map() });
+		assert.deepEqual(await reading({ etag: "0" }).read(), {
+			entries: new Map(),
+			etag: "0",
 		});
-		assert.equal((await bare.pull({})).records.length, 1);
 	});
 
-	it("throws on an unexpected shape (e.g. an error body) instead of caching it as data", async () => {
-		const adapter = createBlobSyncAdapter<V>({
-			read: async () => ({ error: "missing scope" }) as never,
-			write: async () => {},
+	it("parses entries and the etag", async () => {
+		const state = await reading({
+			format: "lww-1",
+			entries: { a: entry("x") },
+			etag: "7",
+		}).read();
+		assert.deepEqual(state, {
+			entries: new Map([["a", entry("x")]]),
+			etag: "7",
 		});
-		await assert.rejects(() => adapter.pull({}), /unexpected shape/);
-	});
-});
-
-describe("createBlobSyncAdapter: push", () => {
-	it("replaces only the pushed records, keeping everyone else's, stored as clean remote data", async () => {
-		const server = createFakeBlobServer<V>();
-		server.put([rec("theirs", "x")]);
-		const adapter = createBlobSyncAdapter<V>(server);
-		const result = await adapter.push?.([
-			mutation(
-				rec("mine", "y", { dirty: true, source: "local", remoteVersion: 7 }),
-			),
-		]);
-		assert.deepEqual(result?.acked, ["m1"]);
-		const stored = server.records.find((r) => r.id === "mine");
-		assert.deepEqual(stored?.meta, {
-			version: 1,
-			createdAt: 0,
-			updatedAt: 0,
-			deleted: false,
-			dirty: false,
-			source: "remote",
-		});
-		assert.ok(server.records.find((r) => r.id === "theirs"));
 	});
 
-	it("rejects an edit based on an outdated copy, returning the current one", async () => {
-		const server = createFakeBlobServer<V>();
-		server.put([rec("k", "theirs", { version: 3 })]);
-		const adapter = createBlobSyncAdapter<V>(server);
-		const result = await adapter.push?.([
-			mutation(rec("k", "mine", { version: 3, remoteVersion: 2, dirty: true })),
-		]);
-		assert.deepEqual(result?.acked, []);
-		assert.equal(result?.rejected?.[0]?.record?.data.v, "theirs");
-		assert.equal(server.writes, 0); // nothing accepted -> nothing written
-	});
-
-	it("accepts an edit whose content already matches the remote, whatever its base", async () => {
-		const server = createFakeBlobServer<V>();
-		server.put([rec("k", "same", { version: 3 })]);
-		const adapter = createBlobSyncAdapter<V>(server);
-		const result = await adapter.push?.([
-			mutation(rec("k", "same", { version: 2, remoteVersion: 1 })),
-		]);
-		assert.deepEqual(result?.acked, ["m1"]);
-	});
-
-	it("records without remoteVersion (written before it existed) are accepted only if ahead", async () => {
-		const server = createFakeBlobServer<V>();
-		server.put([
-			rec("ahead", "old", { version: 2 }),
-			rec("behind", "old", { version: 5 }),
-		]);
-		const adapter = createBlobSyncAdapter<V>(server);
-		const result = await adapter.push?.([
-			mutation(rec("ahead", "new", { version: 3 }), 1),
-			mutation(rec("behind", "new", { version: 1 }), 2),
-		]);
-		assert.deepEqual(result?.acked, ["m1"]);
-		assert.deepEqual(
-			result?.rejected?.map((r) => r.mutationId),
-			["m2"],
-		);
-	});
-
-	it("with etags, a concurrent write is detected and retried on top of it (nothing is erased)", async () => {
-		const server = createFakeBlobServer<V>({ cas: true });
-		server.put([]);
-		const adapter = createBlobSyncAdapter<V>(server);
-		// Another client writes its own record between our read and our write.
-		server.beforeNextWrite(() => server.put([rec("theirs", "x")]));
-		const result = await adapter.push?.([mutation(rec("mine", "y"))]);
-		assert.deepEqual(result?.acked, ["m1"]);
-		assert.deepEqual(server.records.map((r) => r.id).sort(), [
-			"mine",
-			"theirs",
-		]);
-	});
-
-	it("gives up with an error if the blob keeps changing", async () => {
-		const server = createFakeBlobServer<V>({ cas: true });
-		server.put([]);
-		const adapter = createBlobSyncAdapter<V>({
-			read: () => server.read(),
-			write: async () => ({ conflict: true }),
-			maxConflictRetries: 2,
-		});
+	it("throws on an unexpected shape (e.g. an error body) instead of treating it as data", async () => {
+		await assert.rejects(() => reading("oops").read(), /unexpected shape/);
 		await assert.rejects(
-			() => adapter.push?.([mutation(rec("mine", "y"))]) ?? Promise.resolve(),
-			/kept conflicting after 3 attempts/,
+			() => reading({ format: "lww-1", entries: { a: { error: "x" } } }).read(),
+			/malformed entry for "a"/,
+		);
+		await assert.rejects(
+			() => reading({ format: "lww-1", entries: "nope" }).read(),
+			/unexpected shape/,
+		);
+	});
+
+	it("refuses a document in another format, rather than overwrite it", async () => {
+		await assert.rejects(
+			() => reading({ format: "lww-2", entries: {} }).read(),
+			/format "lww-2"/,
+		);
+		// The old format: an old app version still reads (and writes) it.
+		await assert.rejects(
+			() => reading({ records: [] }).read(),
+			/old \{ records \} format/,
 		);
 	});
 });
 
-describe("createBlobSyncAdapter: versions never go backwards", () => {
-	it("a re-sent older copy with the same content is acked without overwriting, and the newer copy returned", async () => {
-		const server = createFakeBlobServer<V>();
-		server.put([rec("k", "same", { version: 2 })]);
-		const adapter = createBlobSyncAdapter(server);
-		const stale = rec("k", "same", {
-			version: 1,
-			dirty: true,
-			source: "local",
+describe("createBlobSyncAdapter: write", () => {
+	it("writes the format marker and entries, passing ifMatch through", async () => {
+		const writes: unknown[] = [];
+		const adapter = createBlobSyncAdapter<V>({
+			read: async () => null,
+			write: async (blob, options) => {
+				writes.push({ blob, options });
+				return { conflict: true };
+			},
 		});
-		const result = await adapter.push?.([mutation(stale)]);
-		assert.deepEqual(result?.acked, ["m1"]);
-		assert.equal(server.records[0]?.meta.version, 2);
-		assert.equal(server.writes, 0);
-		assert.equal(result?.records?.[0]?.meta.version, 2);
+		const result = await adapter.write(new Map([["a", entry("x")]]), {
+			ifMatch: "3",
+		});
+		assert.deepEqual(result, { conflict: true });
+		assert.deepEqual(writes, [
+			{
+				blob: { format: "lww-1", entries: { a: entry("x") } },
+				options: { ifMatch: "3" },
+			},
+		]);
+		// The JSON form is just that.
+		assert.equal(
+			JSON.stringify((writes[0] as { blob: unknown }).blob),
+			'{"format":"lww-1","entries":{"a":{"value":{"v":"x"},"deleted":false,"stamp":5,"device":"d1.t1"}}}',
+		);
+	});
+
+	it("keeps keys that are special in JavaScript objects", async () => {
+		let saved: unknown;
+		const adapter = createBlobSyncAdapter<V>({
+			read: async () => JSON.parse(JSON.stringify(saved)),
+			write: async (blob) => {
+				saved = blob;
+			},
+		});
+		await adapter.write(new Map([["__proto__", entry("x")]]), {});
+		const state = await adapter.read();
+		assert.deepEqual([...state.entries.keys()], ["__proto__"]);
+	});
+});
+
+describe("createBlobSyncAdapter: legacy import", () => {
+	const legacyRecord = {
+		id: "old",
+		data: { v: "from v1" },
+		meta: { version: 3, updatedAt: 1_700_000_000_000, deleted: false },
+	};
+
+	it("imports the old document while the new one is empty (as imported, not remote, entries)", async () => {
+		const state = await reading(
+			{ etag: "0" },
+			{ records: [legacyRecord] },
+		).read();
+		assert.equal(state.entries.size, 0);
+		assert.equal(state.etag, "0");
+		assert.deepEqual(state.imported?.get("old")?.value, { v: "from v1" });
+		assert.equal(state.imported?.get("old")?.device, "legacy");
+	});
+
+	it("ignores the old document once the new one has entries", async () => {
+		const state = await reading(
+			{ format: "lww-1", entries: { a: entry("x") } },
+			{ records: [legacyRecord] },
+		).read();
+		assert.equal(state.imported, undefined);
+	});
+
+	it("accepts a missing old document, and refuses a malformed one", async () => {
+		assert.equal((await reading(null, null).read()).imported, undefined);
+		await assert.rejects(
+			() => reading(null, { error: "boom" }).read(),
+			/Legacy blob read returned an unexpected shape/,
+		);
 	});
 });

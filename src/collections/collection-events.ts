@@ -4,13 +4,17 @@
  */
 import type { RecordEnvelope } from "../records/record-envelope.js";
 
-export type RecordChangeKind = "set" | "removed";
+/**
+ * `"set"`: the key has a value (`record`). `"deleted"`: it was deleted (a tombstone is kept,
+ * so other devices learn of the delete). `"removed"`: it's gone entirely, or its value is
+ * hidden because it failed the validator.
+ */
+export type RecordChangeKind = "set" | "deleted" | "removed";
 
 export interface RecordChange<T> {
-	/** `"set"` = upserted (insert/update/delete-tombstone). `"removed"` = purged from memory. */
 	kind: RecordChangeKind;
 	id: string;
-	/** The new record (present if `kind` is `"set"`). */
+	/** The current record (present if `kind` is `"set"`). */
 	record?: RecordEnvelope<T>;
 }
 

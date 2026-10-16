@@ -1,8 +1,9 @@
-import type { RecordEnvelope } from "../../../src/records/record-envelope.js";
+import type { Entry } from "../../../src/crdt/lww-map.js";
 import type {
 	BlobSnapshot,
 	BlobWriteOptions,
 	BlobWriteResult,
+	LwwBlob,
 } from "../../../src/sync/adapters/blob-sync-adapter.js";
 
 /**
@@ -11,31 +12,33 @@ import type {
  */
 export interface FakeBlobServer<T> {
 	read(): Promise<BlobSnapshot<T> | null>;
-	write(
-		blob: { records: RecordEnvelope<T>[] },
-		options: BlobWriteOptions,
-	): Promise<BlobWriteResult>;
-	readonly records: RecordEnvelope<T>[];
+	write(blob: LwwBlob<T>, options: BlobWriteOptions): Promise<BlobWriteResult>;
+	/** The stored entries (deletes included). */
+	readonly entries: Record<string, Entry<T>>;
+	/** The stored live values, by key. */
+	values(): Map<string, T>;
 	readonly writes: number;
 	/** Run `fn` once, just before the next write lands (simulates a concurrent writer). */
 	beforeNextWrite(fn: () => void): void;
 	/** Overwrite the blob directly (as another client would). */
-	put(records: RecordEnvelope<T>[]): void;
+	put(blob: unknown): void;
 }
 
 export function createFakeBlobServer<T>(
 	options: { cas?: boolean } = {},
 ): FakeBlobServer<T> {
-	let blob: { records: RecordEnvelope<T>[] } | null = null;
+	let blob: unknown = null;
 	let etag = 0;
 	let writes = 0;
 	let hook: (() => void) | undefined;
+	const entries = () =>
+		((blob as LwwBlob<T> | null)?.entries ?? {}) as Record<string, Entry<T>>;
 
 	return {
 		async read() {
-			if (blob === null) return null;
+			if (blob === null) return options.cas ? { etag: String(etag) } : null;
 			return {
-				records: structuredClone(blob.records),
+				...(structuredClone(blob) as BlobSnapshot<T>),
 				...(options.cas ? { etag: String(etag) } : {}),
 			};
 		},
@@ -48,8 +51,15 @@ export function createFakeBlobServer<T>(
 			etag++;
 			writes++;
 		},
-		get records() {
-			return blob?.records ?? [];
+		get entries() {
+			return entries();
+		},
+		values() {
+			return new Map(
+				Object.entries(entries()).flatMap(([key, entry]) =>
+					entry.deleted ? [] : [[key, entry.value as T]],
+				),
+			);
 		},
 		get writes() {
 			return writes;
@@ -57,8 +67,8 @@ export function createFakeBlobServer<T>(
 		beforeNextWrite(fn) {
 			hook = fn;
 		},
-		put(records) {
-			blob = { records: structuredClone(records) };
+		put(next) {
+			blob = structuredClone(next);
 			etag++;
 		},
 	};

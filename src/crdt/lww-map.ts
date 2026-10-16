@@ -41,7 +41,7 @@ export function compareMarks(a: Mark, b: Mark): number {
 }
 
 /** JSON with object keys sorted, so equal values give equal strings. */
-function canonical(value: unknown): string {
+export function canonical(value: unknown): string {
 	if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
 	if (typeof value === "object" && value !== null) {
 		const keys = Object.keys(value).sort();

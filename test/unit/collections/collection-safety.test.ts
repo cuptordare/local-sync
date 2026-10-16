@@ -2,12 +2,10 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { CollectionErrorInfo } from "../../../src/collections/collection-types.js";
 import { createCollection } from "../../../src/collections/create-collection.js";
-import type { RecordEnvelope } from "../../../src/records/record-envelope.js";
-import { lastWriteWins } from "../../../src/records/record-merge.js";
-import { invalid, valid } from "../../../src/records/record-validation.js";
+import type { Entry } from "../../../src/crdt/lww-map.js";
+import { fromGuard, valid } from "../../../src/records/record-validation.js";
 import { createMemoryAdapter } from "../../../src/storage/memory-adapter.js";
 import type { StorageAdapter } from "../../../src/storage/storage-adapter.js";
-import { createStorageEngine } from "../../../src/storage/storage-engine.js";
 import { createDeferred } from "../support/fake-sync-adapter.js";
 
 interface Note {
@@ -20,34 +18,26 @@ function makeCollection(
 ) {
 	return createCollection<Note>({
 		name: "notes",
-		storage: createStorageEngine(createMemoryAdapter()),
+		storage: createMemoryAdapter(),
+		writerId: async () => "me",
 		...overrides,
 	});
 }
 
-function remote(
-	id: string,
-	data: Note,
-	meta: Partial<RecordEnvelope<Note>["meta"]> = {},
-): RecordEnvelope<Note> {
-	return {
-		id,
-		data,
-		meta: {
-			version: 1,
-			createdAt: 0,
-			updatedAt: 0,
-			deleted: false,
-			dirty: false,
-			source: "remote",
-			...meta,
-		},
-	};
-}
+const remote = (value: unknown, stamp = 5): Entry<Note> => ({
+	value: value as Note,
+	deleted: false,
+	stamp,
+	device: "other",
+});
 
-/** A memory adapter whose first readAll() (hydration) waits until released. */
-function makeSlowHydrationAdapter(seed: RecordEnvelope<Note>[]) {
+/** A memory adapter holding `seed`, whose first readAll() (loading) waits until released. */
+async function makeSlowLoadAdapter(seed: Record<string, Note>) {
 	const inner = createMemoryAdapter();
+	await inner.merge(
+		"notes",
+		new Map(Object.entries(seed).map(([k, v]) => [k, { entry: remote(v) }])),
+	);
 	const gate = createDeferred<void>();
 	const adapter: StorageAdapter = {
 		...inner,
@@ -56,11 +46,7 @@ function makeSlowHydrationAdapter(seed: RecordEnvelope<Note>[]) {
 			return inner.readAll(collection);
 		},
 	};
-	return {
-		adapter,
-		seed: () => inner.writeMany("notes", seed),
-		release: () => gate.resolve(),
-	};
+	return { adapter, inner, release: () => gate.resolve() };
 }
 
 describe("collection safety: frozen, private data", () => {
@@ -77,7 +63,7 @@ describe("collection safety: frozen, private data", () => {
 			record.data.tags?.push("b");
 		}, TypeError);
 		assert.throws(() => {
-			record.meta.dirty = false;
+			record.meta.stamp = 0;
 		}, TypeError);
 		assert.equal(notes.peek(id)?.data.text, "hi");
 	});
@@ -96,7 +82,7 @@ describe("collection safety: frozen, private data", () => {
 	it("typed arrays can be stored (they can't be frozen, so they're left as-is)", async () => {
 		const files = createCollection<{ bytes: Uint8Array }>({
 			name: "files",
-			storage: createStorageEngine(createMemoryAdapter()),
+			storage: createMemoryAdapter(),
 		});
 		await files.ready;
 		const id = files.insert({ bytes: new Uint8Array([1, 2, 3]) });
@@ -113,51 +99,34 @@ describe("collection safety: frozen, private data", () => {
 });
 
 describe("collection safety: upsert", () => {
-	it("inserts when missing and replaces when present", async () => {
-		const notes = makeCollection();
-		await notes.ready;
-		notes.upsert("k", { text: "one" });
-		assert.equal(notes.peek("k")?.meta.version, 1);
-		notes.upsert("k", { text: "two" });
-		assert.equal(notes.peek("k")?.data.text, "two");
-		assert.equal(notes.peek("k")?.meta.version, 2);
-	});
-
-	it("is a no-op (no version bump, no notification) when the value is unchanged", async () => {
+	it("is a no-op (no new entry, no notification) when the value is unchanged", async () => {
 		const notes = makeCollection();
 		await notes.ready;
 		notes.upsert("k", { text: "same" });
+		const before = notes.peek("k");
 		let notified = 0;
 		notes.subscribe(() => notified++);
 		notes.upsert("k", { text: "same" });
-		assert.equal(notes.peek("k")?.meta.version, 1);
+		assert.equal(notes.peek("k"), before);
 		assert.equal(notified, 0);
 	});
 
-	it("restores a soft-deleted record", async () => {
+	it("restores a deleted record", async () => {
 		const notes = makeCollection();
 		await notes.ready;
 		notes.upsert("k", { text: "one" });
 		notes.delete("k");
 		notes.upsert("k", { text: "one" });
 		assert.equal(notes.peek("k")?.data.text, "one");
-		assert.equal(notes.peek("k")?.meta.deleted, false);
 	});
 });
 
-describe("collection safety: writes before hydration completes", () => {
+describe("collection safety: writes before loading completes", () => {
 	it("every write before loading finishes throws a clear 'await ready' error, and changes nothing", async () => {
-		const slow = makeSlowHydrationAdapter([remote("k", { text: "stored" })]);
-		await slow.seed();
-		const notes = makeCollection({
-			storage: createStorageEngine(slow.adapter),
-		});
+		const slow = await makeSlowLoadAdapter({ k: { text: "stored" } });
+		const notes = makeCollection({ storage: slow.adapter });
 		assert.equal(notes.hydrated, false);
 		assert.throws(() => notes.insert({ text: "x" }), /await app.ready/);
-		assert.throws(
-			() => notes.insert({ text: "x" }, { id: "k" }),
-			/await app.ready/,
-		);
 		assert.throws(() => notes.upsert("k", { text: "x" }), /await app.ready/);
 		assert.throws(() => notes.update("k", { text: "x" }), /await app.ready/);
 		assert.throws(() => notes.replace("k", { text: "x" }), /await app.ready/);
@@ -166,7 +135,6 @@ describe("collection safety: writes before hydration completes", () => {
 		await notes.ready;
 		assert.equal(notes.hydrated, true);
 		assert.equal(notes.peek("k")?.data.text, "stored");
-		assert.deepEqual(notes.pending(), []);
 		notes.delete("k"); // fine once loaded
 		assert.equal(notes.peek("k"), undefined);
 	});
@@ -174,15 +142,15 @@ describe("collection safety: writes before hydration completes", () => {
 	it("a failed load is reported, and later edits say loading failed (not 'still loading')", async () => {
 		const errors: CollectionErrorInfo[] = [];
 		const notes = makeCollection({
-			storage: createStorageEngine({
+			storage: {
 				...createMemoryAdapter(),
 				readAll: async () => {
 					throw new Error("disk unavailable");
 				},
-			}),
+			},
 			onError: (_error, info) => errors.push(info),
 		});
-		await assert.rejects(notes.ready, /disk unavailable/);
+		await assert.rejects(notes.load(), /disk unavailable/);
 		assert.deepEqual(errors, [{ source: "storage", collection: "notes" }]);
 		assert.throws(
 			() => notes.update("k", { text: "x" }),
@@ -190,17 +158,45 @@ describe("collection safety: writes before hydration completes", () => {
 		);
 	});
 
+	it("a failed load is retried by load() and by `ready`: writes work after", async () => {
+		const inner = createMemoryAdapter();
+		await inner.merge(
+			"notes",
+			new Map([["k", { entry: remote({ text: "stored" }) }]]),
+		);
+		let failures = 2;
+		const notes = makeCollection({
+			storage: {
+				...inner,
+				readAll: async (collection) => {
+					if (failures-- > 0) throw new Error("disk unavailable");
+					return inner.readAll(collection);
+				},
+			},
+			onError: () => {},
+		});
+		await assert.rejects(notes.load(), /disk unavailable/);
+		await assert.rejects(notes.ready, /disk unavailable/);
+		await notes.ready;
+		assert.equal(notes.peek("k")?.data.text, "stored");
+		notes.upsert("k", { text: "after the retry" });
+		await notes.whenPersisted();
+		assert.deepEqual((await inner.readAll("notes")).get("k")?.entry.value, {
+			text: "after the retry",
+		});
+	});
+
 	it("whenPersisted() resolves only after queued writes have landed", async () => {
 		const inner = createMemoryAdapter();
 		const gate = createDeferred<void>();
 		const notes = makeCollection({
-			storage: createStorageEngine({
+			storage: {
 				...inner,
-				async write(collection, record) {
+				async merge(collection, changes) {
 					await gate.promise;
-					return inner.write(collection, record);
+					return inner.merge(collection, changes);
 				},
-			}),
+			},
 		});
 		await notes.ready;
 		const id = notes.insert({ text: "x" });
@@ -212,204 +208,96 @@ describe("collection safety: writes before hydration completes", () => {
 		assert.equal(persisted, false);
 		gate.resolve();
 		await waiting;
-		assert.ok(await inner.read("notes", id));
+		assert.ok((await inner.readAll("notes")).has(id));
 	});
 });
 
-describe("collection safety: applying remote data", () => {
-	it("normalizes remote records even if the adapter forgot to (never pushed back as local edits)", async () => {
-		const notes = makeCollection();
-		await notes.ready;
-		notes.applyRemote([
-			remote("r", { text: "x" }, { dirty: true, source: "local", version: 3 }),
-		]);
-		const record = notes.peek("r");
-		assert.equal(record?.meta.dirty, false);
-		assert.equal(record?.meta.source, "remote");
-		assert.equal(record?.meta.remoteVersion, 3);
-		assert.equal(notes.pending().length, 0);
-	});
+describe("collection safety: values from elsewhere", () => {
+	const isNote = (d: unknown): d is Note =>
+		typeof d === "object" && d !== null && typeof (d as Note).text === "string";
 
-	it("skips records identical to the local copy (no write, no notification)", async () => {
-		const notes = makeCollection();
-		await notes.ready;
-		notes.applyRemote([remote("r", { text: "x" })]);
-		let notified = 0;
-		notes.subscribe(() => notified++);
-		notes.applyRemote([remote("r", { text: "x" })]);
-		assert.equal(notified, 0);
-		notes.applyRemote([remote("r", { text: "y" }, { version: 2 })]);
-		assert.equal(notified, 1);
-		assert.equal(notes.peek("r")?.data.text, "y");
-	});
-
-	it("still records a newer remote version even when the data is identical", async () => {
-		const notes = makeCollection();
-		await notes.ready;
-		notes.applyRemote([remote("r", { text: "x" }, { version: 1 })]);
-		const before = notes.peek("r")?.data;
-		notes.applyRemote([remote("r", { text: "x" }, { version: 4 })]);
-		assert.equal(notes.peek("r")?.meta.remoteVersion, 4);
-		// Same content keeps the same data object, so value watchers see no change.
-		assert.equal(notes.peek("r")?.data, before);
-	});
-
-	it("validates remote records: invalid ones are skipped and reported, valid ones applied", async () => {
-		const errors: Array<{ error: unknown; info: CollectionErrorInfo }> = [];
+	it("an invalid incoming value is kept but hidden, and reported once", async () => {
+		const errors: CollectionErrorInfo[] = [];
 		const notes = makeCollection({
-			validator: (d) =>
-				typeof (d as Note).text === "string"
-					? valid(d as Note)
-					: invalid("text must be a string"),
-			onError: (error, info) => errors.push({ error, info }),
+			validator: fromGuard(isNote, "not a note"),
+			onError: (_e, info) => errors.push(info),
 		});
 		await notes.ready;
-		notes.applyRemote([
-			remote("good", { text: "ok" }),
-			remote("bad", { nope: true } as unknown as Note),
-		]);
-		assert.equal(notes.peek("good")?.data.text, "ok");
+		notes.mergeRemote(
+			new Map([
+				["bad", remote({ nope: 1 })],
+				["good", remote({ text: "ok" })],
+			]),
+			{ synced: true },
+		);
 		assert.equal(notes.peek("bad"), undefined);
-		assert.equal(errors.length, 1);
-		assert.deepEqual(errors[0]?.info, {
-			source: "remote-validation",
-			collection: "notes",
-			id: "bad",
-		});
-	});
-
-	it("a merge that keeps the local edit is stamped with the remote version and supersedes it", async () => {
-		const notes = makeCollection({ merge: lastWriteWins<Note>() });
-		await notes.ready;
-		notes.applyRemote([remote("r", { text: "base" }, { version: 1 })]);
-		notes.update("r", { text: "mine" }, { now: 50 }); // version 2, remoteVersion 1
-		notes.update("r", { text: "mine2" }, { now: 60 }); // version 3, remoteVersion 1
-		// Someone else's edit reached the server as version 2.
-		notes.applyRemote([
-			remote("r", { text: "theirs" }, { version: 2, updatedAt: 10 }),
+		assert.equal(notes.peek("good")?.data.text, "ok");
+		assert.deepEqual(
+			notes
+				.query()
+				.getCurrentResult()
+				.map((r) => r.id),
+			["good"],
+		);
+		// Kept, so this device still agrees with the others about what the key holds.
+		assert.deepEqual(notes.snapshot().get("bad")?.value, { nope: 1 });
+		assert.deepEqual(errors, [
+			{ source: "remote-validation", collection: "notes", id: "bad" },
 		]);
-		const record = notes.peek("r");
-		assert.equal(record?.data.text, "mine2"); // lastWriteWins kept local (version 3 > 2)
-		assert.equal(record?.meta.dirty, true);
-		assert.equal(record?.meta.remoteVersion, 2);
-		assert.ok((record?.meta.version ?? 0) > 2);
+		// A valid newer value shows again.
+		notes.mergeRemote(new Map([["bad", remote({ text: "fixed" }, 9)]]));
+		assert.equal(notes.peek("bad")?.data.text, "fixed");
 	});
 
-	it("markSynced records the acknowledged version as the remote version", async () => {
-		const notes = makeCollection();
-		await notes.ready;
-		const id = notes.insert({ text: "x" });
-		notes.update(id, { text: "y" });
-		notes.markSynced([id]);
-		assert.equal(notes.peek(id)?.meta.remoteVersion, 2);
-	});
-
-	it("removeUnseen hard-removes clean records missing from a snapshot, but keeps local edits", async () => {
-		const notes = makeCollection();
-		await notes.ready;
-		notes.applyRemote([
-			remote("keep", { text: "a" }),
-			remote("gone", { text: "b" }),
-			remote("edited", { text: "c" }),
-		]);
-		notes.update("edited", { text: "local edit" });
-		const removed = notes.removeUnseen(new Set(["keep"]));
-		assert.deepEqual(removed, ["gone"]);
-		assert.ok(notes.peek("keep"));
-		assert.equal(notes.peek("gone"), undefined);
-		assert.equal(notes.peek("edited")?.data.text, "local edit");
-	});
-});
-
-describe("collection safety: loading edge cases", () => {
-	it("a failed load is retried by load(): writes are refused until then, and work after", async () => {
-		const inner = createMemoryAdapter();
-		await inner.writeMany("notes", [remote("k", { text: "stored" })]);
-		let failures = 1;
+	it("local writes are validated, and invalid ones throw", async () => {
 		const notes = makeCollection({
-			storage: createStorageEngine({
-				...inner,
-				readAll: async (collection) => {
-					if (failures-- > 0) throw new Error("disk unavailable");
-					return inner.readAll(collection);
-				},
-			}),
-			onError: () => {},
+			validator: fromGuard(isNote, "not a note"),
 		});
-		await assert.rejects(notes.ready, /disk unavailable/);
+		await notes.ready;
 		assert.throws(
-			() => notes.insert({ text: "x" }),
-			/loading from storage failed/,
+			() => notes.upsert("k", { nope: 1 } as unknown as Note),
+			/not a note/,
 		);
-		await notes.load();
-		assert.equal(notes.hydrated, true);
-		assert.equal(notes.peek("k")?.data.text, "stored"); // the stored record is back
-		const id = notes.insert({ text: "after the retry" });
-		await notes.whenPersisted();
-		assert.equal(
-			((await inner.read("notes", id))?.data as Note | undefined)?.text,
-			"after the retry",
-		);
+		assert.equal(notes.snapshot().size, 0);
 	});
 
-	it("a refresh requested while loading runs once loading has finished", async () => {
-		const slow = makeSlowHydrationAdapter([remote("k", { text: "stored" })]);
-		await slow.seed();
-		const notes = makeCollection({
-			storage: createStorageEngine(slow.adapter),
-		});
-		const refreshed = notes.refreshFromStorage(["k"]); // e.g. another tab announced "k"
-		await slow.adapter.write(
-			"notes",
-			remote("k", { text: "from another tab" }, { version: 2 }),
-		);
-		slow.release();
-		await refreshed;
-		assert.equal(notes.hydrated, true);
-		assert.equal(notes.peek("k")?.data.text, "from another tab");
-	});
-
-	it("removes many records in one storage batch", async () => {
-		const inner = createMemoryAdapter();
-		await inner.writeMany("notes", [
-			remote("a", { text: "a" }),
-			remote("b", { text: "b" }),
-			remote("c", { text: "c" }),
-		]);
-		const batches: string[][] = [];
-		let singleRemoves = 0;
-		const notes = makeCollection({
-			storage: createStorageEngine({
-				...inner,
-				async remove(collection, id) {
-					singleRemoves++;
-					return inner.remove(collection, id);
-				},
-				async removeMany(collection, ids) {
-					batches.push([...ids]);
-					return inner.removeMany?.(collection, ids);
-				},
-			}),
-		});
-		await notes.ready;
-		notes.removeUnseen(new Set());
-		await notes.whenPersisted();
-		assert.deepEqual(batches, [["a", "b", "c"]]);
-		assert.equal(singleRemoves, 0);
-		assert.deepEqual(await inner.readAll("notes"), []);
-	});
-});
-
-describe("collection safety: validator output from remote data", () => {
-	it("isn't frozen in place, so a validator may reuse shared objects (e.g. defaults)", async () => {
+	it("a validator's output isn't frozen in place, so it may reuse shared objects (e.g. defaults)", async () => {
 		const DEFAULT_TAGS: string[] = [];
 		const notes = makeCollection({
 			validator: (d) => valid({ ...(d as Note), tags: DEFAULT_TAGS }),
 		});
 		await notes.ready;
-		notes.applyRemote([remote("r", { text: "from the server" })]);
+		notes.mergeRemote(new Map([["r", remote({ text: "from the server" })]]));
 		assert.equal(Object.isFrozen(notes.peek("r")?.data.tags), true); // stored copy: frozen
 		assert.equal(Object.isFrozen(DEFAULT_TAGS), false); // the validator's own: untouched
 		DEFAULT_TAGS.push("still usable");
+	});
+});
+
+describe("collection safety: replaceAll (source snapshots)", () => {
+	it("writes changed values, keeps unchanged entries, and removes the rest from storage", async () => {
+		const inner = createMemoryAdapter();
+		const notes = makeCollection({ storage: inner });
+		await notes.ready;
+		notes.replaceAll(
+			new Map([
+				["a", { text: "a" }],
+				["b", { text: "b" }],
+			]),
+		);
+		const a = notes.peek("a");
+		notes.replaceAll(
+			new Map([
+				["a", { text: "a" }],
+				["c", { text: "c" }],
+			]),
+		);
+		assert.equal(notes.peek("a"), a); // unchanged: same entry
+		assert.equal(notes.peek("b"), undefined);
+		await notes.whenPersisted();
+		assert.deepEqual([...(await inner.readAll("notes")).keys()].sort(), [
+			"a",
+			"c",
+		]);
 	});
 });

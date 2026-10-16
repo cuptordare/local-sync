@@ -1,13 +1,27 @@
+/**
+ * Sync engines: when and how often to pull and push, with status, retries, offline handling,
+ * a debounced push after local edits, and a flush when the page is hidden or closed.
+ *
+ * `createSyncEngine` syncs a collection with a `SyncAdapter`:
+ *   - pull: read the remote's entries and merge them in.
+ *   - push: read the remote's entries, merge them in, and -- if this side has entries the
+ *     remote lacks -- write the merge of both with compare-and-swap (`ifMatch`), re-reading
+ *     and retrying if someone else wrote first.
+ * Both are merges (see crdt/lww-map.ts), so it doesn't matter if a pull is stale, a reply is
+ * lost, a push repeats, or another tab or device syncs at the same moment: whatever is read
+ * is merged, and an entry is only "pending" until the remote is seen to hold it.
+ *
+ * `createEngine` is the scheduling core, shared with read-only sources (see app/source.ts).
+ */
 import type { Collection } from "../collections/collection-types.js";
+import type { Entry } from "../crdt/lww-map.js";
+import { keysNewerIn, mergeEntries } from "../crdt/lww-map.js";
 import { createEventBus } from "../events/event-bus.js";
 import type { Listener, Unsubscribe } from "../events/event-types.js";
 import type { NetworkStatus } from "../network/network-status.js";
-import type { RecordEnvelope } from "../records/record-envelope.js";
-import { isOwnSaveBefore } from "../records/record-envelope.js";
-import { deepEqual } from "../utils/deep-equal.js";
 import { createSerialTask } from "../utils/serial-task.js";
 import { now as defaultNow } from "../utils/timestamps.js";
-import type { PullArgs, SyncAdapter } from "./sync-adapter.js";
+import type { RemoteState, SyncAdapter } from "./sync-adapter.js";
 import type {
 	PushOnChangeOptions,
 	SyncEngine,
@@ -15,254 +29,124 @@ import type {
 } from "./sync-engine.js";
 import { DEFAULT_PUSH_DEBOUNCE_MS } from "./sync-engine.js";
 import type { SyncEventMap } from "./sync-events.js";
-import { buildMutations } from "./sync-queue.js";
 import type { RetryOptions, Sleep } from "./sync-retries.js";
 import { withRetry } from "./sync-retries.js";
 import { createSyncStatus } from "./sync-status.js";
 
-/** Hard stop for a paginated pull, so a misbehaving adapter can't loop forever. */
-const MAX_PULL_PAGES = 1000;
-/**
- * After this many consecutive conflict rejections for one record, stop auto-resolving and
- * hold it back (as if rejected outright) -- protects against an adapter that always rejects.
- */
-const MAX_CONSECUTIVE_CONFLICTS = 3;
+/** Compare-and-swap conflicts in a row before a push attempt counts as failed (and retries). */
+const MAX_WRITE_CONFLICTS = 5;
 
-export interface CreateSyncEngineOptions<
-	T extends object,
-	Filter = unknown,
-	Cursor = unknown,
-> {
+export interface CreateSyncEngineOptions<T extends object> {
 	collection: Collection<T>;
-	adapter: SyncAdapter<T, Filter, Cursor>;
+	adapter: SyncAdapter<T>;
 	/** Optional connectivity source; when offline, sync work is skipped. */
 	network?: NetworkStatus;
-	/** Initial pull filter. */
-	filter?: Filter;
 	/** Retry/backoff policy for pull/push. */
 	retry?: RetryOptions;
 	/** Injectable sleep (tests pass a no-op to avoid real delays). */
 	sleep?: Sleep;
 	/** Injectable clock. */
 	now?: () => number;
-	/**
-	 * Optimistic-until-acknowledged: when true (default), a pull will NOT overwrite records with
-	 * un-pushed local edits -- your optimistic change stays visible until you push it, and the
-	 * server's push response then resolves it. Set false to resolve conflicts at pull time via
-	 * the merge strategy (the server may win and discard the local edit).
-	 */
-	keepPendingOnPull?: boolean;
-	/**
-	 * After a successful push, hard-remove tombstones the remote has now acknowledged (compaction).
-	 * Keeps local storage from accumulating deleted records. Default false: only enable it for an
-	 * adapter whose pulls stop returning a tombstone once it's acknowledged. If pulls keep
-	 * returning it (e.g. `createBlobSyncAdapter`, which keeps tombstones so other clients learn
-	 * of the delete), every pull re-adds it, and re-creating a deleted id starts over at version 1
-	 * -- which the remote then rejects as stale.
-	 */
-	purgeDeletedOnPush?: boolean;
 }
 
-export function createSyncEngine<
-	T extends object,
-	Filter = unknown,
-	Cursor = unknown,
->(options: CreateSyncEngineOptions<T, Filter, Cursor>): SyncEngine<Filter> {
-	const { collection, adapter, network } = options;
-	const clock = options.now ?? defaultNow;
-	const retry = options.retry ?? {};
-	const sleep = options.sleep;
+export function createSyncEngine<T extends object>(
+	options: CreateSyncEngineOptions<T>,
+): SyncEngine {
+	const { collection, adapter } = options;
+	const retrying = <R>(fn: () => Promise<R>) =>
+		withRetry(fn, options.retry ?? {}, options.sleep);
 
-	const keepPendingOnPull = options.keepPendingOnPull ?? true;
-	const purgeDeletedOnPush = options.purgeDeletedOnPush ?? false;
-	let filter = options.filter;
-	let filterGeneration = 0;
-	let cursor: Cursor | undefined;
+	const take = (remote: RemoteState<T>): void => {
+		if (remote.imported !== undefined && remote.imported.size > 0) {
+			collection.mergeRemote(remote.imported); // not on the remote yet: pending
+		}
+		collection.mergeRemote(remote.entries, { synced: true });
+	};
+
+	const write = adapter.write?.bind(adapter);
+	const push =
+		write === undefined
+			? undefined
+			: () =>
+					retrying(async () => {
+						for (let conflicts = 0; ; conflicts++) {
+							const remote = await adapter.read();
+							take(remote);
+							const local = collection.snapshot();
+							const outgoing = keysNewerIn(local, remote.entries);
+							if (outgoing.length === 0) return; // the remote has everything
+							const merged = mergeEntries(remote.entries, local);
+							const result = await write(
+								merged,
+								remote.etag === undefined ? {} : { ifMatch: remote.etag },
+							);
+							if (result?.conflict !== true) {
+								const saved = new Map<string, Entry<T>>();
+								for (const key of outgoing)
+									saved.set(key, merged.get(key) as Entry<T>);
+								collection.mergeRemote(saved, { synced: true });
+								return;
+							}
+							if (conflicts + 1 >= MAX_WRITE_CONFLICTS) {
+								throw new Error(
+									`Writing "${collection.name}" kept conflicting (it is being changed concurrently)`,
+								);
+							}
+						}
+					});
+
+	return createEngine({
+		...(options.network !== undefined ? { network: options.network } : {}),
+		...(options.now !== undefined ? { now: options.now } : {}),
+		load: () => collection.load(),
+		async pull() {
+			take(await retrying(() => adapter.read()));
+			return true;
+		},
+		...(push !== undefined ? { push } : {}),
+		pendingCount: () => collection.pending().length,
+		watch: (onChange) =>
+			collection.subscribe(({ changes }) => {
+				const pending = new Set(collection.pending());
+				onChange(changes.some((c) => pending.has(c.id)));
+			}),
+	});
+}
+
+/** What an engine drives. */
+export interface EngineOperations {
+	network?: NetworkStatus;
+	now?: () => number;
+	/** Load local data (retrying a failed load). */
+	load(): Promise<void>;
+	/** Fetch and apply the remote's data. Resolves false if abandoned (e.g. the filter changed). */
+	pull(): Promise<boolean>;
+	/** Save local changes (and take in the remote's). Omit when read-only. */
+	push?: () => Promise<void>;
+	/** How many local changes are waiting to be pushed. */
+	pendingCount(): number;
+	/** Report local data changes; `pushNeeded` if they include changes to push. */
+	watch(onChange: (pushNeeded: boolean) => void): Unsubscribe;
+	setFilter?(filter: unknown): void;
+}
+
+export function createEngine<Filter = unknown>(
+	ops: EngineOperations,
+): SyncEngine<Filter> {
+	const { network } = ops;
+	const clock = ops.now ?? defaultNow;
 	let started = false;
 	let disposed = false;
 	let timer: ReturnType<typeof setInterval> | undefined;
 
-	// Records the remote rejected without sending its copy: id -> the version that was rejected.
-	// They stay dirty but aren't pushed again until edited (i.e. their version changes).
-	const heldBack = new Map<string, number>();
-	// Consecutive conflict rejections per record, while it stays dirty: reset once the record is
-	// clean again (acknowledged, or the merge settled it on the remote's copy).
-	const conflictCounts = new Map<string, number>();
-
 	const status = createSyncStatus({ online: network?.isOnline() ?? true });
 	const events = createEventBus<SyncEventMap>();
 
-	const isHeldBack = (record: RecordEnvelope<T>): boolean =>
-		heldBack.get(record.id) === record.meta.version;
-
-	// The push backlog is simply the collection's dirty records (durable via storage).
 	const updatePending = (): void => {
-		const dirty = collection.pending();
-		const dirtyVersions = new Map(dirty.map((r) => [r.id, r.meta.version]));
-		for (const [id, version] of heldBack) {
-			// Edited since (new version), synced, or removed: no longer held back.
-			if (dirtyVersions.get(id) !== version) heldBack.delete(id);
-		}
-		for (const id of conflictCounts.keys()) {
-			if (!dirtyVersions.has(id)) conflictCounts.delete(id);
-		}
-		status.patch({ pending: dirty.length, rejected: heldBack.size });
+		status.patch({ pending: ops.pendingCount() });
 	};
 	const guardOnline = (): boolean =>
 		network === undefined || network.isOnline();
-
-	// --- core operations (no status/event bookkeeping; that's added by the wrapper) ---
-
-	/** Returns false if the pull was abandoned (disposed, or the filter changed meanwhile). */
-	const runPull = async (): Promise<boolean> => {
-		if (!collection.hydrated) await collection.load();
-		// Records a snapshot must keep: those in any page, plus any changed during the pull by
-		// something else (e.g. a push acked between pages) -- earlier pages predate that change,
-		// so they can't prove the record is gone.
-		const seen = new Set<string>();
-		const stopWatching = collection.subscribe(({ changes }) => {
-			for (const change of changes) seen.add(change.id);
-		});
-		try {
-			return await pullPages(seen);
-		} finally {
-			stopWatching();
-		}
-	};
-
-	const pullPages = async (seen: Set<string>): Promise<boolean> => {
-		const generation = filterGeneration;
-		const startCursor = cursor;
-		let pageCursor = startCursor;
-		let lastCursor: Cursor | undefined;
-		let complete = false;
-		let count = 0;
-		for (let page = 1; ; page++) {
-			const args: PullArgs<Filter, Cursor> = {};
-			if (filter !== undefined) args.filter = filter;
-			if (pageCursor !== undefined) args.cursor = pageCursor;
-			const result = await withRetry(() => adapter.pull(args), retry, sleep);
-			if (disposed) return false;
-			// The filter changed while this page was loading: these results are for the old
-			// filter, so drop them (setFilter queued a fresh pull for the new one).
-			if (generation !== filterGeneration) return false;
-			// Pull preserves un-pushed local edits (optimistic-until-acknowledged) when enabled.
-			collection.applyRemote(result.records, {
-				keepPending: keepPendingOnPull,
-			});
-			count += result.records.length;
-			for (const record of result.records) seen.add(record.id);
-			if (result.cursor !== undefined) lastCursor = result.cursor;
-			if (result.complete) {
-				complete = true;
-				break;
-			}
-			if (!result.hasMore) break;
-			if (result.cursor === undefined || deepEqual(result.cursor, pageCursor)) {
-				throw new Error(
-					`Pull for collection "${collection.name}" returned hasMore without a new cursor; ` +
-						"stopping to avoid an endless loop. Return the next page's cursor with hasMore.",
-				);
-			}
-			if (page >= MAX_PULL_PAGES) {
-				throw new Error(
-					`Pull for collection "${collection.name}" exceeded ${MAX_PULL_PAGES} pages; stopping.`,
-				);
-			}
-			pageCursor = result.cursor;
-		}
-		// Only now -- after every page succeeded -- act on the pull as a whole. (Advancing the
-		// cursor page-by-page would make a retried snapshot resume mid-way and then treat the
-		// records from the pages it skipped as deleted.)
-		if (complete) collection.removeUnseen(seen);
-		cursor = complete ? undefined : (lastCursor ?? startCursor);
-		events.emit("pull:success", { count });
-		return true;
-	};
-
-	/** Returns true if a conflict was resolved into a local edit that should be pushed again. */
-	const runPush = async (): Promise<boolean> => {
-		if (!collection.hydrated) await collection.load();
-		const pushFn = adapter.push;
-		if (pushFn === undefined) return false;
-		const toPush = collection.pending().filter((r) => !isHeldBack(r));
-		const mutations = buildMutations(collection.name, toPush);
-		if (mutations.length === 0) return false;
-		// Remember exactly which record objects were pushed, to detect records that changed
-		// locally (edited, deleted, or replaced by another tab's write) while the push was
-		// in flight. Records are immutable, so "same object" means "same content" -- unlike a
-		// version number, which two tabs can independently bump to the same value.
-		const pushedRecords = new Map(mutations.map((m) => [m.recordId, m.record]));
-		const result = await withRetry(() => pushFn(mutations), retry, sleep);
-		if (disposed) return false;
-		// Only records that are still exactly what was pushed may take the server's response
-		// or be marked synced; applying it to anything newer would overwrite that change
-		// (e.g. resurrecting a record the user deleted during the round-trip).
-		const byMutationId = new Map(mutations.map((m) => [m.mutationId, m]));
-		// Re-checked after each step below, since each step changes records.
-		let pendingNow = new Map<string, RecordEnvelope<T>>();
-		const recheck = (): void => {
-			pendingNow = new Map(collection.pending().map((r) => [r.id, r]));
-		};
-		const unchanged = (id: string): boolean => {
-			const p = pendingNow.get(id);
-			return p !== undefined && p === pushedRecords.get(id);
-		};
-		recheck();
-		// A returned copy of a REJECTED record is handled with the rejection (below), not
-		// applied here -- applying it first would change the record and skip the rejection.
-		const rejectedIds = new Set(
-			(result.rejected ?? []).flatMap((r) => {
-				const m = byMutationId.get(r.mutationId);
-				return m === undefined ? [] : [m.recordId];
-			}),
-		);
-		const returned = new Map((result.records ?? []).map((r) => [r.id, r]));
-		const freshRecords = (result.records ?? []).filter(
-			(r) => unchanged(r.id) && !rejectedIds.has(r.id),
-		);
-
-		// Acks first: an acknowledged record is then clean, so the server's copy of it (below)
-		// simply replaces it, rather than being "merged" with the very edit it accepted.
-		// (A record edited during the push stays dirty, but builds on the accepted version.)
-		const ackedSet = new Set(result.acked);
-		collection.acknowledge(
-			mutations.filter((m) => ackedSet.has(m.mutationId)).map((m) => m.record),
-		);
-		if (freshRecords.length > 0) collection.applyRemote(freshRecords);
-		recheck();
-
-		let repush = false;
-		for (const rejection of result.rejected ?? []) {
-			const mutation = byMutationId.get(rejection.mutationId);
-			if (mutation === undefined || !unchanged(mutation.recordId)) continue;
-			const id = mutation.recordId;
-			const current = rejection.record ?? returned.get(id);
-			const conflicts = (conflictCounts.get(id) ?? 0) + 1;
-			if (current !== undefined && conflicts <= MAX_CONSECUTIVE_CONFLICTS) {
-				conflictCounts.set(id, conflicts);
-				collection.applyRemote([{ ...current, id }]);
-				// This device's own earlier save (e.g. its reply was lost): the collection
-				// builds on it, and it's no conflict worth reporting.
-				const ownSave = isOwnSaveBefore(
-					collection.deviceId,
-					mutation.record,
-					current,
-				);
-				if (!ownSave) events.emit("conflict", { id, reason: rejection.reason });
-				repush = true;
-			} else {
-				heldBack.set(id, mutation.record.meta.version);
-				events.emit("push:rejected", { id, reason: rejection.reason });
-			}
-		}
-
-		if (purgeDeletedOnPush) collection.purgeDeleted();
-		events.emit("push:success", { count: result.acked.length });
-		return repush;
-	};
-
-	// --- public operations (with status + event bookkeeping) ---
 
 	// The latest unresolved failure per direction. Tracked separately so that a successful
 	// pull doesn't hide a push that keeps failing (or vice versa): the phase stays "error"
@@ -290,8 +174,11 @@ export function createSyncEngine<
 		events.emit("sync:error", { phase: direction, error: err });
 	};
 
-	const succeed = (direction: "pull" | "push", startedAt: number): void => {
-		delete failures[direction];
+	const succeed = (
+		directions: ReadonlyArray<"pull" | "push">,
+		startedAt: number,
+	): void => {
+		for (const direction of directions) delete failures[direction];
 		const finishedAt = clock();
 		status.patch({
 			lastSyncedAt: finishedAt,
@@ -305,15 +192,17 @@ export function createSyncEngine<
 	// afterwards. A pass that fails while another is queued (e.g. a pull for a filter that
 	// was just changed) gives way to that one instead of reporting its error.
 
-	// One pull at a time: overlapping pulls could finish out of order, letting an older
-	// (e.g. previous-filter) result overwrite a newer one.
 	const pullTask = createSerialTask(
 		async () => {
 			if (disposed || !guardOnline()) return;
 			const startedAt = clock();
 			events.emit("sync:start", { direction: "pull" });
 			markBusy();
-			if (await runPull()) succeed("pull", startedAt);
+			await ops.load();
+			if (await ops.pull()) {
+				succeed(["pull"], startedAt);
+				events.emit("pull:success");
+			}
 			// Abandoned: nothing was synced, so no success to record (or failure to clear).
 			else publishOutcome();
 		},
@@ -322,41 +211,26 @@ export function createSyncEngine<
 
 	const pushTask = createSerialTask(
 		async () => {
-			if (!collection.hydrated) await collection.load();
-			if (disposed || !guardOnline()) return false;
-			if (!collection.pending().some((r) => !isHeldBack(r))) {
+			await ops.load();
+			if (disposed || !guardOnline() || ops.push === undefined) return;
+			if (ops.pendingCount() === 0) {
 				// Nothing left that could fail to push: an earlier push failure no longer applies.
 				if (failures.push !== undefined) {
 					delete failures.push;
 					publishOutcome();
 				}
-				return false;
+				return;
 			}
 			const startedAt = clock();
 			events.emit("sync:start", { direction: "push" });
 			markBusy();
-			const repush = await runPush();
-			succeed("push", startedAt);
-			return repush;
+			await ops.push();
+			// A push reads (and merges) the remote too, so it's also a successful pull.
+			succeed(["push", "pull"], startedAt);
+			events.emit("push:success");
 		},
 		{ onFailure: (err) => reportFailure("push", err) },
 	);
-
-	// Failures are already reported by the push/pull they came from.
-	const syncTask = createSerialTask(async () => {
-		if (disposed || !guardOnline()) return;
-		// Pull even if the push failed: a push that keeps failing (e.g. the server rejects
-		// the batch) must not also stop this device from receiving everyone else's changes.
-		let pushError: { error: unknown } | undefined;
-		try {
-			await push();
-		} catch (error) {
-			pushError = { error };
-		}
-		await pull();
-		if (pushError !== undefined) throw pushError.error;
-		events.emit("sync:success", { direction: "full" });
-	});
 
 	const pull = async (): Promise<void> => {
 		if (disposed || !guardOnline()) return;
@@ -364,10 +238,19 @@ export function createSyncEngine<
 	};
 
 	const push = async (): Promise<void> => {
-		if (disposed || !guardOnline()) return;
-		if (adapter.push === undefined) return;
+		if (disposed || !guardOnline() || ops.push === undefined) return;
 		await pushTask.run();
 	};
+
+	// A push includes a pull; without changes to push, pull (and push anything the pull
+	// brought in, e.g. imported data).
+	const syncTask = createSerialTask(async () => {
+		if (disposed || !guardOnline()) return;
+		await ops.load();
+		if (ops.push === undefined || ops.pendingCount() === 0) await pull();
+		await push();
+		events.emit("sync:success", { direction: "full" });
+	});
 
 	const sync = async (): Promise<void> => {
 		if (disposed || !guardOnline()) return;
@@ -421,8 +304,7 @@ export function createSyncEngine<
 		status.patch({ pushScheduled: true });
 	};
 
-	// A push already running is waited for too: closing during it would otherwise drop the
-	// server's answer, leaving a saved change marked unpushed (and its next edit "conflicting").
+	// A push already running is waited for too, so closing doesn't cut it off.
 	const flush = (): Promise<void> => {
 		if (isPushScheduled()) return runScheduledPush();
 		if (pushTask.running) return push().catch(() => {});
@@ -430,8 +312,8 @@ export function createSyncEngine<
 	};
 
 	// Flush a scheduled push when the page is hidden or closed, so a quick edit-then-close
-	// still reaches the server. Best effort: if the browser kills the request, the change is
-	// still dirty in storage and is pushed on the next sync.
+	// still reaches the remote. Best effort: if the browser kills the request, the change is
+	// still pending in storage and is pushed on the next sync.
 	let detachHideFlush: Unsubscribe | undefined;
 	const attachHideFlush = (): void => {
 		if (
@@ -456,30 +338,20 @@ export function createSyncEngine<
 
 	// --- wiring: keep the pending count fresh and auto-push on local change ---
 
-	const collectionSub = collection.subscribe(({ changes }) => {
+	const stopWatching = ops.watch((pushNeeded) => {
 		updatePending();
-		// Only a local edit (a dirty record) schedules a push -- not remote data or acks.
-		const hasLocalEdit = changes.some((c) => c.record?.meta.dirty === true);
-		if (
-			started &&
-			hasLocalEdit &&
-			adapter.push !== undefined &&
-			guardOnline()
-		) {
+		if (started && pushNeeded && ops.push !== undefined && guardOnline()) {
 			schedulePush();
 		}
 	});
 
-	// Once hydration completes, dirty records loaded from storage are already "pending"
-	// (no seeding needed -- the dirty flag is the backlog); just refresh the count.
-	void collection.ready.then(
+	// Once loaded, changes stored offline earlier are already pending; refresh the count.
+	void ops.load().then(
 		() => {
 			if (!disposed) updatePending();
 		},
-		() => {}, // hydration failures surface through pull/push (which retry the load)
+		() => {}, // load failures surface through pull/push (which retry the load)
 	);
-
-	// --- wiring: react to connectivity ---
 
 	let networkSub: Unsubscribe | undefined;
 	if (network !== undefined) {
@@ -508,9 +380,7 @@ export function createSyncEngine<
 		sync,
 		flush,
 		setFilter(next: Filter) {
-			filter = next;
-			filterGeneration += 1;
-			cursor = undefined;
+			ops.setFilter?.(next);
 			// A pull already running for the old filter discards its results; run another for
 			// the new filter once it stops.
 			pullTask.rerunIfRunning();
@@ -558,7 +428,7 @@ export function createSyncEngine<
 			if (disposed) return;
 			stop();
 			disposed = true;
-			collectionSub();
+			stopWatching();
 			networkSub?.();
 		},
 	};

@@ -2,17 +2,14 @@
  * Keeps several open tabs of one app consistent (internal; enabled by createLocalSyncApp).
  *
  * Without this, each tab keeps its own in-memory copy of shared storage: an edit in one tab
- * doesn't show in the others, a stale tab can write old data back, and every tab polls the
- * remote. With it:
- *   - After a tab's write lands in storage, it announces the record ids; other tabs re-read
- *     just those records from storage (storage stays the single source of truth, so tabs
- *     converge regardless of message order).
+ * doesn't show in the others, and every tab polls the remote. With it:
+ *   - After a tab's write lands in storage, it sends the stored entries to the other tabs,
+ *     which merge them (see crdt/lww-map.ts). Storage is written by merging too, so tabs
+ *     agree with it whatever order the writes and messages happen in.
  *   - Only one tab (the leader) runs automatic sync. The others show the leader's sync
- *     status. Manual syncs still work from any tab (pushes are idempotent and
- *     version-checked, so an overlap is harmless). The leader shares which collections it
- *     syncs; a follower syncs a collection only its own page uses until the leader has it too.
- *   - Sync bookkeeping writes (acks, remote data) re-check the stored copy first, so a tab
- *     never overwrites another tab's newer write with a result based on an outdated copy.
+ *     status. Manual syncs still work from any tab (syncs are merges, so an overlap is
+ *     harmless). The leader shares which collections it syncs; a follower syncs a
+ *     collection only its own page uses until the leader has it too.
  *   - Filter changes on a read-only source are shared, so the leader's refreshes keep
  *     fetching what the tabs are actually showing.
  *
@@ -21,8 +18,9 @@
  * timers. A tab keeps leading until it closes. Without Web Locks or BroadcastChannel,
  * multi-tab is off.
  */
-import type { TabChannel } from "../network/multi-tab-sync.js";
-import { createBroadcastChannelTab } from "../network/multi-tab-sync.js";
+import type { TabChannel } from "../network/tab-channel.js";
+import { createBroadcastChannelTab } from "../network/tab-channel.js";
+import type { StoredEntry } from "../storage/storage-adapter.js";
 import type { AppSyncState } from "./app-status.js";
 
 /** The part of the Web Locks API's `LockManager` (`navigator.locks`) used for leader election. */
@@ -38,15 +36,24 @@ export interface MultiTabOptions {
 }
 
 type Message =
-	| { type: "changed"; collection: string; ids: string[] }
+	| {
+			type: "entries";
+			collection: string;
+			changes: Array<[string, StoredEntry]>;
+			removed: string[];
+	  }
 	| { type: "status"; state: AppSyncState }
 	| { type: "status-request" }
 	| { type: "filter"; collection: string; filter: unknown }
 	| { type: "collections"; names: string[] };
 
 export interface AppMultiTabHandlers {
-	/** Another tab persisted these records: re-read them from storage. */
-	onChanged(collection: string, ids: readonly string[]): void;
+	/** Another tab stored these entries (and removed these keys): merge them in. */
+	onEntries(
+		collection: string,
+		changes: ReadonlyMap<string, StoredEntry>,
+		removed: readonly string[],
+	): void;
 	/** The leader's sync status (undefined when this tab becomes the leader). */
 	onLeaderStatus(state: AppSyncState | undefined): void;
 	/** This tab now runs automatic sync (until it closes). */
@@ -60,7 +67,11 @@ export interface AppMultiTabHandlers {
 export interface AppMultiTab {
 	/** This tab runs automatic sync. */
 	isLeader(): boolean;
-	announceChanged(collection: string, ids: readonly string[]): void;
+	announceEntries(
+		collection: string,
+		changes: ReadonlyMap<string, StoredEntry>,
+		removed: readonly string[],
+	): void;
 	announceFilter(collection: string, filter: unknown): void;
 	/** Share this tab's sync status (only sent while leader). */
 	publishStatus(state: AppSyncState): void;
@@ -100,8 +111,12 @@ export function createAppMultiTab(
 	const stopMessages = channel.subscribe((raw) => {
 		const message = raw as Message;
 		switch (message.type) {
-			case "changed":
-				handlers.onChanged(message.collection, message.ids);
+			case "entries":
+				handlers.onEntries(
+					message.collection,
+					new Map(message.changes),
+					message.removed,
+				);
 				break;
 			case "status":
 				if (!leader) handlers.onLeaderStatus(message.state);
@@ -144,8 +159,13 @@ export function createAppMultiTab(
 
 	return {
 		isLeader: () => leader,
-		announceChanged(collection, ids) {
-			post({ type: "changed", collection, ids: [...ids] });
+		announceEntries(collection, changes, removed) {
+			post({
+				type: "entries",
+				collection,
+				changes: [...changes],
+				removed: [...removed],
+			});
 		},
 		announceFilter(collection, filter) {
 			post({ type: "filter", collection, filter });

@@ -22,8 +22,6 @@ export interface AppSyncState {
 	pending: number;
 	/** A debounced push is scheduled somewhere (changes are about to be saved). */
 	pushScheduled: boolean;
-	/** Changes the remote rejected and that are held back until edited again. */
-	rejected: number;
 	/** When every collection had last synced successfully (the oldest of them); undefined until all have. */
 	lastSyncedAt: number | undefined;
 	/** The first failing collection's error, prefixed with its name. */
@@ -64,7 +62,6 @@ export function createAppSyncStatus(
 			online: getNetwork()?.isOnline() ?? true,
 			pending: 0,
 			pushScheduled: false,
-			rejected: 0,
 			lastSyncedAt: undefined,
 			lastError: undefined,
 		};
@@ -74,7 +71,6 @@ export function createAppSyncStatus(
 			const s = engine.getState();
 			if (PHASE_RANK[s.phase] > PHASE_RANK[state.phase]) state.phase = s.phase;
 			state.pending += s.pending;
-			state.rejected += s.rejected;
 			state.pushScheduled ||= s.pushScheduled;
 			if (s.lastError !== undefined && state.lastError === undefined) {
 				state.lastError = `${name}: ${s.lastError}`;

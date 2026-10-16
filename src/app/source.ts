@@ -21,12 +21,13 @@
  *   issues.query((i) => i.status !== "Done").subscribe(render);
  */
 import type { Collection } from "../collections/collection-types.js";
+import type { NetworkStatus } from "../network/network-status.js";
 import type { ReactiveQuery } from "../reactivity/reactive-query.js";
 import { createReactiveQuery } from "../reactivity/reactive-query.js";
-import type { RecordEnvelope } from "../records/record-envelope.js";
-import type { Validator } from "../records/record-validation.js";
-import type { SyncAdapter } from "../sync/sync-adapter.js";
+import { createEngine } from "../sync/create-sync-engine.js";
 import type { SyncEngine } from "../sync/sync-engine.js";
+import type { RetryOptions, Sleep } from "../sync/sync-retries.js";
+import { withRetry } from "../sync/sync-retries.js";
 import { deepEqual } from "../utils/deep-equal.js";
 
 export interface SourcePage<T, Cursor = unknown> {
@@ -78,73 +79,103 @@ export interface SourceAdapterOptions<T, Filter, Cursor> {
 	getId(item: T): string | number;
 }
 
+/** Hard stop for a paginated fetch, so a misbehaving `fetchPage` can't loop forever. */
+const MAX_PAGES = 1000;
+
+export interface SourceEngineOptions<T, Filter, Cursor>
+	extends SourceAdapterOptions<T, Filter, Cursor> {
+	filter?: Filter;
+	retry?: RetryOptions;
+	/** Injectable sleep for retries (tests pass a no-op). */
+	sleep?: Sleep;
+	network?: NetworkStatus;
+	now?: () => number;
+}
+
 /**
- * Wrap a page-fetching function as a pull-only, full-snapshot SyncAdapter. Each item becomes a
- * remote record whose version only moves when the item's content changes, so an unchanged
- * item costs no storage write and wakes no query on refresh.
+ * The engine that keeps a source's collection up to date: each pull fetches every page and
+ * makes the collection hold exactly those items (`replaceAll`), so items that disappeared at
+ * the source disappear locally too, and unchanged ones keep their entry (no write, no
+ * re-render). Nothing is changed unless every page succeeds.
  */
-export function createSourceAdapter<T extends object, Filter, Cursor>(
+export function createSourceEngine<T extends object, Filter, Cursor>(
 	name: string,
-	/** The cached copy of an item, to keep its version stable while it's unchanged. */
-	peek: (id: string) => RecordEnvelope<T> | undefined,
-	options: SourceAdapterOptions<T, Filter, Cursor>,
-	clock: () => number,
-	/** The collection's validator: the cached copy holds its output, so compare against that. */
-	validator?: Validator<T>,
-): SyncAdapter<T, Filter, Cursor> {
-	const asStored = (item: T): unknown => {
-		if (validator === undefined) return item;
-		const result = validator(structuredClone(item));
-		return result.ok ? result.value : item; // invalid: the collection skips and reports it
-	};
-	return {
-		async pull({ filter, cursor }) {
-			const page = await options.fetchPage({ filter, cursor });
+	collection: Collection<T>,
+	options: SourceEngineOptions<T, Filter, Cursor>,
+): SyncEngine<Filter> {
+	let filter = options.filter;
+	let generation = 0;
+
+	const fetchAll = async (): Promise<Map<string, T> | undefined> => {
+		const started = generation;
+		const items = new Map<string, T>();
+		let cursor: Cursor | undefined;
+		for (let page = 1; ; page++) {
+			const args = { filter, cursor };
+			const result = await withRetry(
+				() => options.fetchPage(args),
+				options.retry ?? {},
+				options.sleep,
+			);
+			// The filter changed while this page was loading: these results are for the old
+			// filter, so drop them (setFilter queued a fresh pull for the new one).
+			if (started !== generation) return undefined;
 			if (
-				page === null ||
-				typeof page !== "object" ||
-				!Array.isArray(page.items)
+				result === null ||
+				typeof result !== "object" ||
+				!Array.isArray(result.items)
 			) {
 				throw new Error(
 					`fetchPage for source "${name}" must return { items: [...], nextCursor? }`,
 				);
 			}
-			const now = clock();
-			const records = page.items.map((item): RecordEnvelope<T> => {
-				const rawId = options.getId(item);
-				if (
-					(typeof rawId !== "string" && typeof rawId !== "number") ||
-					rawId === ""
-				) {
-					throw new Error(
-						`getId for source "${name}" returned ${JSON.stringify(rawId)}; it must return a non-empty string or number`,
-					);
-				}
-				const id = String(rawId);
-				const existing = peek(id);
-				const unchanged =
-					existing !== undefined && deepEqual(existing.data, asStored(item));
-				return {
-					id,
-					data: item,
-					meta: {
-						version: unchanged
-							? existing.meta.version
-							: (existing?.meta.version ?? 0) + 1,
-						createdAt: existing?.meta.createdAt ?? now,
-						updatedAt: unchanged ? existing.meta.updatedAt : now,
-						deleted: false,
-						dirty: false,
-						source: "remote",
-					},
-				};
-			});
-			const hasMore = page.nextCursor !== undefined;
-			return hasMore
-				? { records, cursor: page.nextCursor as Cursor, hasMore: true }
-				: { records, complete: true };
-		},
+			for (const item of result.items) items.set(idOf(item), item);
+			if (result.nextCursor === undefined) return items;
+			if (deepEqual(result.nextCursor, cursor)) {
+				throw new Error(
+					`fetchPage for source "${name}" returned the same nextCursor twice; stopping ` +
+						"to avoid an endless loop. Omit nextCursor on the last page.",
+				);
+			}
+			if (page >= MAX_PAGES) {
+				throw new Error(
+					`fetchPage for source "${name}" returned more than ${MAX_PAGES} pages; stopping.`,
+				);
+			}
+			cursor = result.nextCursor;
+		}
 	};
+
+	const idOf = (item: T): string => {
+		const rawId = options.getId(item);
+		if (
+			(typeof rawId !== "string" && typeof rawId !== "number") ||
+			rawId === ""
+		) {
+			throw new Error(
+				`getId for source "${name}" returned ${JSON.stringify(rawId)}; it must return a non-empty string or number`,
+			);
+		}
+		return String(rawId);
+	};
+
+	return createEngine<Filter>({
+		...(options.network !== undefined ? { network: options.network } : {}),
+		...(options.now !== undefined ? { now: options.now } : {}),
+		load: () => collection.load(),
+		async pull() {
+			const items = await fetchAll();
+			if (items === undefined) return false;
+			collection.replaceAll(items);
+			return true;
+		},
+		pendingCount: () => 0,
+		watch: () => () => {},
+		setFilter(next) {
+			filter = next as Filter;
+			generation += 1;
+		},
+	});
 }
 
 const readOnlyError = (name: string, method: string) => () => {
@@ -176,10 +207,9 @@ export function toReadonlyCollection<T extends object>(
 		"replace",
 		"upsert",
 		"delete",
-		"applyRemote",
-		"markSynced",
-		"removeUnseen",
-		"purgeDeleted",
+		"mergeRemote",
+		"mergeFromTab",
+		"replaceAll",
 	]) {
 		Object.defineProperty(view, method, {
 			value: readOnlyError(collection.name, method),

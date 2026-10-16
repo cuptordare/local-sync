@@ -1,113 +1,92 @@
 /**
- * A collection ties the lower layers together: it holds an in-memory store
- * (collection-store), persists through a StorageEngine, validates writes, and
+ * A collection is one last-writer-wins map (see crdt/lww-map.ts) with an API for records: it
+ * holds the entries in memory, persists them through a StorageAdapter, validates writes, and
  * hands out live ReactiveQuery objects.
  *
- * Mutation flow (optimistic, local-first):
- *   1. validate the data
- *   2. build a new immutable envelope (version bumped, dirty=true) around a private,
- *      deep-frozen copy of the data -- so neither the caller's object nor a read result
- *      can later change the stored record behind the collection's back
- *   3. apply to the in-memory store synchronously -> queries update immediately
- *   4. enqueue a durable write to storage (serialized to preserve order)
+ * Every change -- a local write, data from the remote, another tab's write, the stored copy
+ * -- goes through one merge: per key, the newer entry wins. Merges can happen in any order,
+ * more than once, from any tab, and the result is the same, so there are no special cases
+ * for what arrives when. Storage is written the same way (an atomic merge), so it can't be
+ * rolled back by an older write either.
  *
- * Reads: `query`/`get` return live queries (tombstones filtered out); `peek` is a one-shot
- * read. `get(id)` is cached/shared by id so multiple consumers share one subscription.
- * Everything a read returns is frozen.
+ * Writes: validate, stamp with this tab's clock (so it beats every entry this tab has seen),
+ * merge into memory (queries update at once), then persist in the background.
  *
  * @example
  *   const todos = createCollection<{ title: string; done: boolean }>({
  *     name: "todos",
- *     storage: createStorageEngine(createMemoryAdapter()),
+ *     storage: createMemoryAdapter(),
  *   });
- *   const id = todos.insert({ title: "Buy milk", done: false }); // optimistic
+ *   await todos.ready;
+ *   const id = todos.insert({ title: "Buy milk", done: false });
  *   const active = todos.query((data) => !data.done); // live query
  *   const off = active.subscribe((rows) => render(rows));
  *   todos.update(id, { done: true }); // `active` recomputes; the row drops out
  */
+import type { HybridClock } from "../crdt/hlc.js";
+import { createHybridClock, stampTime } from "../crdt/hlc.js";
+import type { Entry, Mark } from "../crdt/lww-map.js";
+import { compareMarks, laterMark, newerEntry } from "../crdt/lww-map.js";
 import type { Listener, Unsubscribe } from "../events/event-types.js";
+import { fromLegacyRecords } from "../migration/legacy.js";
 import { createReactiveCache } from "../reactivity/reactive-cache.js";
 import type { ReactiveQuery } from "../reactivity/reactive-query.js";
 import { createReactiveQuery } from "../reactivity/reactive-query.js";
 import type { RecordEnvelope } from "../records/record-envelope.js";
 import {
-	createEnvelope,
-	deleteEnvelope,
-	isOwnSaveBefore,
-	markSynced as markRecordSynced,
-	updateEnvelope,
-} from "../records/record-envelope.js";
-import { serverWins } from "../records/record-merge.js";
-import {
 	passthrough,
 	ValidationError,
 	validateOrThrow,
 } from "../records/record-validation.js";
-import { loadDeviceId } from "../storage/device-id.js";
+import { loadWriterId } from "../storage/device-id.js";
+import type { StoredEntry } from "../storage/storage-adapter.js";
 import { deepEqual } from "../utils/deep-equal.js";
 import { deepFreeze } from "../utils/freeze.js";
+import { createId } from "../utils/ids.js";
 import { logBackgroundError } from "../utils/log-error.js";
-import { now as defaultNow } from "../utils/timestamps.js";
-import type { CollectionChange } from "./collection-events.js";
-import { createCollectionStore } from "./collection-store.js";
+import type { CollectionChange, RecordChange } from "./collection-events.js";
 import type {
-	ApplyRemoteOptions,
 	Collection,
 	CreateCollectionOptions,
 	InsertOptions,
-	MutateOptions,
 	QueryPredicate,
 } from "./collection-types.js";
+
+interface Incoming<T> {
+	entry?: Entry<T>;
+	synced?: Mark;
+}
 
 export function createCollection<T extends object>(
 	options: CreateCollectionOptions<T>,
 ): Collection<T> {
 	const { name, storage } = options;
 	const validate = options.validator ?? passthrough<T>();
-	const merge = options.merge ?? serverWins<T>();
-	const clock = options.now ?? defaultNow;
+	const clock: HybridClock = options.clock ?? createHybridClock();
 	const handleError = options.onError ?? logBackgroundError;
+	const writerId = options.writerId ?? (() => loadWriterId(storage));
 
-	const sharedStorage = options.sharedStorage ?? false;
-
-	const store = createCollectionStore<T>();
+	const entries = new Map<string, Entry<T>>();
+	/** Per key, the newest write the remote is known to hold. */
+	const synced = new Map<string, Mark>();
+	/** Keys changed in memory that still need writing to storage. */
+	const unsaved = new Set<string>();
+	/** The envelope each entry is read as; null if its value failed the validator. */
+	const views = new WeakMap<Entry<T>, RecordEnvelope<T> | null>();
+	const listeners = new Set<Listener<readonly RecordChange<T>[]>>();
 	const cache = createReactiveCache();
+	let writer: string | undefined;
 	let disposed = false;
 	let hydrated = false;
 	let loadFailed = false;
-	/** This device's id (see device-id.ts), known once loading has finished. */
-	let deviceId: string | undefined;
-
-	// Serialize persistence so later version never lands before an earlier version. (Writes
-	// are only allowed once loading has succeeded, so none can land before the stored state
-	// has been read.)
-	let writeChain: Promise<void> = Promise.resolve();
-	/**
-	 * Queue a storage write; once it has landed, report which records it touched (`ids`, or the
-	 * ids the task returns if it skipped some).
-	 */
-	const enqueueWrite = (
-		ids: readonly string[],
-		// biome-ignore lint/suspicious/noConfusingVoidType: plain storage writes resolve to void
-		task: () => Promise<readonly string[] | void>,
-	): void => {
-		writeChain = writeChain
-			.then(async () => {
-				const written = (await task()) ?? ids;
-				if (written.length > 0) options.onPersist?.(written);
-			})
-			.catch((err) =>
-				handleError(err, { source: "storage", collection: name }),
-			);
-	};
 
 	const assertActive = () => {
 		if (disposed) throw new Error(`Collection "${name}" has been disposed`);
 	};
 
 	/**
-	 * Local writes need the stored records loaded first: otherwise a write couldn't tell
-	 * whether a record exists, and could overwrite a stored copy it never saw.
+	 * Local writes need the stored entries loaded first: a write must be stamped later than
+	 * every entry it could have seen, and needs to know whether a record exists.
 	 */
 	const assertWritable = (verb: string): void => {
 		assertActive();
@@ -115,8 +94,8 @@ export function createCollection<T extends object>(
 		if (loadFailed) {
 			throw new Error(
 				`Cannot ${verb} in collection "${name}": loading from storage failed (see the ` +
-					"reported storage error). Loading is retried on the next sync, or by calling " +
-					"collection.load().",
+					"reported storage error). Loading is retried on the next sync, by " +
+					"app.ready(), or by calling collection.load().",
 			);
 		}
 		throw new Error(
@@ -125,184 +104,208 @@ export function createCollection<T extends object>(
 		);
 	};
 
-	const missingRecordError = (verb: string, id: string): Error =>
-		new Error(`Cannot ${verb} missing record "${id}" in collection "${name}"`);
+	// --- reading ---
+
+	/** The record a key reads as: undefined if missing, deleted, or invalid. */
+	const visible = (key: string): RecordEnvelope<T> | undefined => {
+		const entry = entries.get(key);
+		if (entry === undefined || entry.deleted) return undefined;
+		let view = views.get(entry);
+		if (view === undefined) {
+			// A value this tab didn't write: check it (written elsewhere, or by older code).
+			const result = validate(entry.value);
+			if (result.ok) {
+				// The validator's output is copied before freezing: it may reuse its own objects.
+				const data =
+					result.value === entry.value
+						? result.value
+						: structuredClone(result.value);
+				view = deepFreeze({ id: key, data, meta: metaOf(entry) });
+			} else {
+				view = null;
+				handleError(new ValidationError(result.issues), {
+					source: "remote-validation",
+					collection: name,
+					id: key,
+				});
+			}
+			views.set(entry, view);
+		}
+		return view ?? undefined;
+	};
+
+	const metaOf = (entry: Entry<T>) => ({
+		stamp: entry.stamp,
+		device: entry.device,
+		updatedAt: stampTime(entry.stamp),
+	});
+
+	const changeOf = (key: string): RecordChange<T> => {
+		const entry = entries.get(key);
+		if (entry?.deleted) return { kind: "deleted", id: key };
+		const record = visible(key);
+		return record === undefined
+			? { kind: "removed", id: key }
+			: { kind: "set", id: key, record };
+	};
+
+	const notify = (keys: readonly string[]): void => {
+		if (keys.length === 0 || disposed) return;
+		const changes = keys.map(changeOf);
+		for (const listener of [...listeners]) listener(changes);
+	};
 
 	const subscribeToStore = (onChange: () => void): Unsubscribe => {
-		return store.subscribe(() => onChange());
+		const listener = () => onChange();
+		listeners.add(listener);
+		return () => listeners.delete(listener);
 	};
 
-	const visible = (
-		record: RecordEnvelope<T> | undefined,
-	): RecordEnvelope<T> | undefined => {
-		return record && !record.meta.deleted ? record : undefined;
-	};
+	// --- merging and persisting ---
 
-	/**
-	 * How many times this tab itself changed each record (local edits and sync bookkeeping --
-	 * not copies taken from storage), so a refresh can tell whether it would undo one.
-	 */
-	const ownChanges = new Map<string, number>();
-	const noteOwnChange = (id: string): void => {
-		ownChanges.set(id, (ownChanges.get(id) ?? 0) + 1);
-	};
+	let persistChain: Promise<void> = Promise.resolve();
+	let persistQueued = false;
 
-	/** Store a locally-written record (its data must already be a private copy). */
-	const commitLocal = (edit: RecordEnvelope<T>): void => {
-		const base = store.get(edit.id); // the copy this edit was made from
-		// Stamped with this device, so it can later recognise this save on the remote.
-		const record =
-			deviceId === undefined
-				? edit
-				: { ...edit, meta: { ...edit.meta, writer: deviceId } };
-		const frozen = deepFreeze(record);
-		store.set(frozen);
-		noteOwnChange(frozen.id);
-		if (!sharedStorage || base === undefined) {
-			enqueueWrite([frozen.id], () => storage.write(name, frozen));
+	/** Write the unsaved keys to storage (merged there, so it never undoes a newer write). */
+	const persistUnsaved = async (): Promise<void> => {
+		persistQueued = false;
+		if (unsaved.size === 0) return;
+		const keys = [...unsaved];
+		unsaved.clear();
+		const changes = new Map<string, StoredEntry>();
+		for (const key of keys) {
+			const entry = entries.get(key);
+			if (entry === undefined) continue; // removed meanwhile
+			const mark = synced.get(key);
+			changes.set(
+				key,
+				mark === undefined ? { entry } : { entry, synced: mark },
+			);
+		}
+		try {
+			await storage.merge(name, changes);
+		} catch (err) {
+			// Kept unsaved: written with the next change.
+			for (const key of keys) if (entries.has(key)) unsaved.add(key);
+			handleError(err, { source: "storage", collection: name });
 			return;
 		}
-		// Another tab may have stored `base` as accepted by the remote meanwhile (it pushed it):
-		// then this edit builds on that accepted version. Checked and written atomically.
-		enqueueWrite([frozen.id], async () => {
-			let rebased: RecordEnvelope<T> | undefined;
-			await storage.update(name, [frozen.id], ([stored]) => {
-				rebased = acceptedBaseOf(stored as RecordEnvelope<T> | undefined, base)
-					? withRemoteVersion(frozen, stored?.meta.remoteVersion)
-					: undefined;
-				return { write: [rebased ?? frozen], remove: [] };
+		options.onPersist?.(changes, []);
+	};
+
+	const schedulePersist = (): void => {
+		if (persistQueued) return;
+		persistQueued = true;
+		// A microtask later, so a burst of changes is one storage write.
+		persistChain = persistChain.then(persistUnsaved);
+	};
+
+	/** Merge entries and synced marks into memory; returns the keys that changed. */
+	const absorb = (
+		incoming: ReadonlyMap<string, Incoming<T>>,
+		persist: boolean,
+	): void => {
+		const changed: string[] = [];
+		for (const [key, { entry, synced: mark }] of incoming) {
+			let didChange = false;
+			if (entry !== undefined) {
+				clock.receive(entry.stamp);
+				const current = entries.get(key);
+				const winner = newerEntry(current, entry) as Entry<T>;
+				if (winner !== current) {
+					entries.set(key, deepFreeze(winner));
+					didChange = true;
+				}
+			}
+			if (mark !== undefined) {
+				const current = synced.get(key);
+				const later = laterMark(current, mark) as Mark;
+				if (later !== current) {
+					synced.set(key, later);
+					didChange = true;
+				}
+			}
+			if (didChange) {
+				changed.push(key);
+				if (persist) unsaved.add(key);
+			}
+		}
+		if (persist && changed.length > 0) schedulePersist();
+		notify(changed);
+	};
+
+	/** Write values (null = delete) as new entries from this tab. */
+	const commit = (values: ReadonlyMap<string, T | null>): void => {
+		const incoming = new Map<string, Incoming<T>>();
+		for (const [key, value] of values) {
+			const entry: Entry<T> = deepFreeze({
+				value,
+				deleted: value === null,
+				stamp: clock.now(),
+				device: writer as string,
 			});
-			if (
-				rebased !== undefined &&
-				!disposed &&
-				store.get(frozen.id) === frozen
-			) {
-				store.set(deepFreeze(rebased));
-				noteOwnChange(frozen.id);
+			if (value !== null) {
+				// Already validated: read as is.
+				views.set(
+					entry,
+					deepFreeze({ id: key, data: value, meta: metaOf(entry) }),
+				);
+			}
+			incoming.set(key, { entry });
+		}
+		absorb(incoming, true);
+	};
+
+	const removeKeys = (keys: readonly string[]): void => {
+		if (keys.length === 0) return;
+		for (const key of keys) {
+			entries.delete(key);
+			synced.delete(key);
+			unsaved.delete(key);
+		}
+		notify(keys);
+		persistChain = persistChain.then(async () => {
+			try {
+				await storage.remove(name, keys);
+				options.onPersist?.(new Map(), keys);
+			} catch (err) {
+				handleError(err, { source: "storage", collection: name });
 			}
 		});
 	};
 
-	/** Whether `stored` is `base` itself, since marked as accepted at a newer remote version. */
-	const acceptedBaseOf = (
-		stored: RecordEnvelope<T> | undefined,
-		base: RecordEnvelope<T>,
-	): boolean =>
-		stored !== undefined &&
-		stored.meta.remoteVersion !== undefined &&
-		stored.meta.remoteVersion > (base.meta.remoteVersion ?? -1) &&
-		stored.meta.version === base.meta.version &&
-		stored.meta.deleted === base.meta.deleted &&
-		deepEqual(stored.data, base.data);
-
-	const withRemoteVersion = (
-		record: RecordEnvelope<T>,
-		remoteVersion: number | undefined,
-	): RecordEnvelope<T> | undefined =>
-		remoteVersion === undefined ||
-		remoteVersion <= (record.meta.remoteVersion ?? -1)
-			? undefined
-			: { ...record, meta: { ...record.meta, remoteVersion } };
-
-	interface SyncChange {
-		id: string;
-		base: RecordEnvelope<T> | undefined;
-		next: RecordEnvelope<T> | undefined;
-		/**
-		 * If another tab stored a newer copy meanwhile, what to store instead (e.g. that copy,
-		 * updated with what this change learned); undefined = leave the stored copy as it is.
-		 */
-		ifSuperseded?: (stored: RecordEnvelope<T>) => RecordEnvelope<T> | undefined;
-	}
-
-	/**
-	 * Store bookkeeping changes made on the strength of this tab's in-memory copy (sync results:
-	 * acks, remote data, compaction). `base` is the copy each change was made from; `next` the
-	 * result (undefined = remove). With shared storage, another tab may have stored a newer
-	 * write since this tab read `base`: that record is left as stored (and taken back into
-	 * memory) instead of being overwritten with a change based on an outdated copy. The check
-	 * and the write are one atomic storage update, so no other tab can write in between.
-	 */
-	const persistSyncChanges = (changes: readonly SyncChange[]): void => {
-		if (changes.length === 0) return;
-		const ids = changes.map((c) => c.id);
-		for (const id of ids) noteOwnChange(id);
-		const toStore = (list: readonly SyncChange[]) => ({
-			write: list.flatMap((c) => (c.next === undefined ? [] : [c.next])),
-			remove: list.flatMap((c) => (c.next === undefined ? [c.id] : [])),
-		});
-		enqueueWrite(ids, async () => {
-			if (!sharedStorage) {
-				const { write, remove } = toStore(changes);
-				if (write.length > 0) await storage.writeMany(name, write);
-				await storage.removeMany(name, remove);
-				return ids;
-			}
-			let written: string[] = [];
-			let superseded: Array<{
-				change: SyncChange;
-				stored: RecordEnvelope<T> | undefined;
-			}> = [];
-			await storage.update(name, ids, (stored) => {
-				const unchanged: SyncChange[] = [];
-				const replacements: RecordEnvelope<T>[] = [];
-				superseded = [];
-				changes.forEach((c, i) => {
-					const fresh = stored[i] as RecordEnvelope<T> | undefined;
-					if (deepEqual(fresh, c.base)) {
-						unchanged.push(c);
-						return;
-					}
-					const replacement =
-						fresh === undefined ? undefined : c.ifSuperseded?.(fresh);
-					if (replacement !== undefined) replacements.push(replacement);
-					superseded.push({ change: c, stored: replacement ?? fresh });
-				});
-				written = [...unchanged, ...replacements].map((c) => c.id);
-				const { write, remove } = toStore(unchanged);
-				return { write: [...write, ...replacements], remove };
-			});
-			// Stored copy changed since: keep it, and adopt it unless edited here meanwhile.
-			const adopt: RecordEnvelope<T>[] = [];
-			const drop: string[] = [];
-			for (const { change, stored } of superseded) {
-				if (disposed || store.get(change.id) !== change.next) continue;
-				if (stored === undefined) drop.push(change.id);
-				else adopt.push(deepFreeze(withSameDataAs(change.next, stored)));
-			}
-			if (adopt.length > 0) store.setMany(adopt);
-			if (drop.length > 0) store.removeMany(drop);
-			return written;
-		});
-	};
-
-	/** Validate, then take a private copy the caller can't mutate afterwards. */
-	const ownValue = (data: unknown): T =>
-		structuredClone(validateOrThrow(validate, data));
-
-	const finishLoading = (map: Map<string, unknown>): void => {
-		if (disposed) return;
-		// Storage is type-erased as RecordEnvelope<unknown>; the collection owns its T.
-		store.setMany(
-			[...(map.values() as Iterable<RecordEnvelope<T>>)].map((r) =>
-				deepFreeze(r),
-			),
-		);
-		hydrated = true;
-	};
+	// --- loading ---
 
 	let loadAttempt: Promise<void> | undefined;
-	/** Load from storage, unless loaded or loading already. A failed load is tried again. */
 	const load = (): Promise<void> => {
 		if (loadAttempt !== undefined && !loadFailed) return loadAttempt;
 		loadFailed = false;
-		const attempt = Promise.all([
-			storage.hydrate(name),
-			loadDeviceId(storage),
-		]).then(([map, id]) => {
-			deviceId = id;
-			finishLoading(map);
-		});
+		const attempt = (async () => {
+			const [stored, legacy, id] = await Promise.all([
+				storage.readAll(name),
+				options.importLegacy !== false && storage.readLegacy !== undefined
+					? storage.readLegacy(name)
+					: [],
+				writerId(),
+			]);
+			// Records an older version stored on this device: import the ones newer than what's
+			// stored. The conversion is deterministic, so this is safe to repeat (and picks up
+			// writes an old tab still open made since).
+			const imports = new Map<string, StoredEntry>();
+			for (const [key, entry] of fromLegacyRecords(legacy)) {
+				const current = stored.get(key)?.entry;
+				if (newerEntry(current, entry) !== current) imports.set(key, { entry });
+			}
+			if (imports.size > 0) {
+				for (const [key, merged] of await storage.merge(name, imports)) {
+					stored.set(key, merged);
+				}
+			}
+			if (disposed) return;
+			writer = id;
+			absorb(stored as Map<string, Incoming<T>>, false);
+			hydrated = true;
+		})();
 		// A failed load is reported like any other storage error (so it's never silent), and
 		// still rejects for anyone awaiting it -- but isn't also an unhandled rejection.
 		attempt.catch((err: unknown) => {
@@ -315,414 +318,149 @@ export function createCollection<T extends object>(
 	// Read the stored state first. Queries start empty and fill in when this resolves.
 	void load();
 
+	// --- writing ---
+
+	/** Validate, then take a private copy the caller can't mutate afterwards. */
+	const ownValue = (data: unknown): T =>
+		structuredClone(validateOrThrow(validate, data));
+
+	const missingRecordError = (verb: string, id: string): Error =>
+		new Error(`Cannot ${verb} missing record "${id}" in collection "${name}"`);
+
+	/** Store `value` unless the key already holds an equal one. */
+	const put = (id: string, value: T): void => {
+		const current = visible(id);
+		if (current !== undefined && deepEqual(current.data, value)) return;
+		commit(new Map([[id, value]]));
+	};
+
 	const insert = (data: T, opts: InsertOptions = {}): string => {
 		assertWritable("insert");
-		if (opts.id !== undefined && store.get(opts.id) !== undefined) {
+		const id = opts.id ?? createId();
+		if (visible(id) !== undefined) {
 			throw new Error(
-				`Cannot insert: record "${opts.id}" already exists in collection "${name}"`,
+				`Cannot insert: record "${id}" already exists in collection "${name}"`,
 			);
 		}
-		const record = createEnvelope(ownValue(data), {
-			...(opts.id !== undefined ? { id: opts.id } : {}),
-			now: opts.now ?? clock(),
-		});
-		commitLocal(record);
-		return record.id;
+		commit(new Map([[id, ownValue(data)]]));
+		return id;
 	};
 
-	const replace = (id: string, data: T, opts: MutateOptions = {}): void => {
+	const replace = (id: string, data: T): void => {
 		assertWritable("replace");
-		const current = store.get(id);
-		if (current === undefined) throw missingRecordError("replace", id);
-		commitLocal(
-			updateEnvelope(current, ownValue(data), { now: opts.now ?? clock() }),
-		);
+		if (visible(id) === undefined) throw missingRecordError("replace", id);
+		put(id, ownValue(data));
 	};
 
-	const update = (
-		id: string,
-		patch: Partial<T>,
-		opts: MutateOptions = {},
-	): void => {
+	const update = (id: string, patch: Partial<T>): void => {
 		assertWritable("update");
-		const current = store.get(id);
+		const current = visible(id);
 		if (current === undefined) throw missingRecordError("update", id);
-		commitLocal(
-			updateEnvelope(current, ownValue({ ...current.data, ...patch }), {
-				now: opts.now ?? clock(),
-			}),
-		);
+		put(id, ownValue({ ...current.data, ...patch }));
 	};
 
-	const upsert = (id: string, data: T, opts: MutateOptions = {}): void => {
+	const upsert = (id: string, data: T): void => {
 		assertWritable("upsert");
-		const current = store.get(id);
-		const value = ownValue(data);
-		if (
-			current !== undefined &&
-			!current.meta.deleted &&
-			deepEqual(current.data, value)
-		) {
-			return; // no-op write: nothing to version, persist, or push
-		}
-		const now = opts.now ?? clock();
-		commitLocal(
-			current === undefined
-				? createEnvelope(value, { id, now })
-				: updateEnvelope(current, value, { now }),
-		);
+		put(id, ownValue(data));
 	};
 
-	const remove = (id: string, opts: MutateOptions = {}): void => {
+	const remove = (id: string): void => {
 		assertWritable("delete");
-		const current = store.get(id);
-		if (current === undefined || current.meta.deleted) return;
-		commitLocal(deleteEnvelope(current, { now: opts.now ?? clock() }));
+		const entry = entries.get(id);
+		if (entry === undefined || entry.deleted) return;
+		commit(new Map([[id, null]]));
 	};
 
-	const peek = (id: string): RecordEnvelope<T> | undefined => {
-		return visible(store.get(id));
-	};
+	// --- queries ---
 
-	const get = (id: string): ReactiveQuery<RecordEnvelope<T> | undefined> => {
-		return cache.get(`doc:${id}`, () =>
+	const get = (id: string): ReactiveQuery<RecordEnvelope<T> | undefined> =>
+		cache.get(`doc:${id}`, () =>
 			createReactiveQuery({
-				compute: () => visible(store.get(id)),
+				compute: () => visible(id),
 				subscribeToSources: subscribeToStore,
 			}),
 		);
-	};
 
 	const query = (
 		predicate?: QueryPredicate<T>,
-	): ReactiveQuery<RecordEnvelope<T>[]> => {
-		return createReactiveQuery({
+	): ReactiveQuery<RecordEnvelope<T>[]> =>
+		createReactiveQuery({
 			compute: () =>
-				store
-					.getAll()
-					.filter(
-						(r) => !r.meta.deleted && (!predicate || predicate(r.data, r)),
-					),
+				[...entries.keys()].flatMap((key) => {
+					const record = visible(key);
+					return record !== undefined &&
+						(predicate === undefined || predicate(record.data, record))
+						? [record]
+						: [];
+				}),
 			subscribeToSources: subscribeToStore,
 		});
-	};
 
 	const subscribe = (listener: Listener<CollectionChange<T>>): Unsubscribe => {
-		return store.subscribe((changes) => {
+		const wrapped = (changes: readonly RecordChange<T>[]) =>
 			listener({ collection: name, changes });
-		});
+		listeners.add(wrapped);
+		return () => listeners.delete(wrapped);
 	};
 
-	// --- Sync Integration ---
+	// --- sync integration ---
 
-	const pending = (): RecordEnvelope<T>[] => {
-		return store.getAll().filter((r) => r.meta.dirty);
+	const isPending = (key: string, entry: Entry<T>): boolean => {
+		const mark = synced.get(key);
+		return mark === undefined || compareMarks(entry, mark) > 0;
 	};
 
-	/**
-	 * When only metadata changed (e.g. a newer remote version with identical content), keep the
-	 * existing data object: readers then see the same reference, so watchers and queries
-	 * comparing values treat it as "no change" cheaply.
-	 */
-	const withSameDataAs = (
-		current: RecordEnvelope<T> | undefined,
-		next: RecordEnvelope<T>,
-	): RecordEnvelope<T> =>
-		current !== undefined &&
-		current.data !== next.data &&
-		deepEqual(current.data, next.data)
-			? { ...next, data: current.data }
-			: next;
+	const mergeRemote: Collection<T>["mergeRemote"] = (remote, opts = {}) => {
+		assertActive();
+		const incoming = new Map<string, Incoming<T>>();
+		for (const [key, entry] of remote) {
+			incoming.set(
+				key,
+				opts.synced
+					? { entry, synced: { stamp: entry.stamp, device: entry.device } }
+					: { entry },
+			);
+		}
+		absorb(incoming, true);
+	};
 
-	/** Whether `local` already matches what the remote is sending (nothing to apply). */
-	const matchesRemote = (
-		local: RecordEnvelope<T>,
-		remote: RecordEnvelope<T>,
-	): boolean =>
-		local.meta.version === remote.meta.version &&
-		local.meta.remoteVersion === remote.meta.version &&
-		local.meta.deleted === remote.meta.deleted &&
-		deepEqual(local.data, remote.data);
-
-	/**
-	 * Validate an incoming remote record, take a private copy, and normalize its meta:
-	 * whatever the adapter sent, remote data is clean, remote-sourced, and is its own
-	 * remoteVersion. Returns undefined (after reporting) if validation fails.
-	 */
-	const prepareRemote = (
-		incoming: RecordEnvelope<T>,
-	): RecordEnvelope<T> | undefined => {
-		let data = incoming.data;
-		if (!incoming.meta.deleted) {
-			const result = validate(incoming.data);
+	const replaceAll = (values: ReadonlyMap<string, unknown>): void => {
+		assertWritable("refresh");
+		const changed = new Map<string, T>();
+		for (const [key, value] of values) {
+			const result = validate(value);
 			if (!result.ok) {
 				handleError(new ValidationError(result.issues), {
 					source: "remote-validation",
 					collection: name,
-					id: incoming.id,
+					id: key,
 				});
-				return undefined;
-			}
-			data = result.value;
-		}
-		// Copied after validation (as local writes are): the collection freezes what it stores,
-		// and neither the adapter's objects nor anything the validator reused may be frozen.
-		return {
-			id: incoming.id,
-			data: structuredClone(data),
-			meta: {
-				...incoming.meta,
-				source: "remote",
-				dirty: false,
-				remoteVersion: incoming.meta.version,
-			},
-		};
-	};
-
-	/** Resolve a dirty local record against the remote via the merge strategy. */
-	const settleConflict = (
-		local: RecordEnvelope<T>,
-		remote: RecordEnvelope<T>,
-	): RecordEnvelope<T> => {
-		// The remote's copy is this device's own earlier save (e.g. its reply was lost): no
-		// other device has saved since, so the local edit simply builds on it -- no conflict.
-		const merged = isOwnSaveBefore(deviceId, local, remote)
-			? local
-			: merge.merge(local, remote);
-		// Whatever the strategy decided, this copy has now seen the remote's version. Without
-		// this, a strategy that keeps the local edit as-is (e.g. lastWriteWins returning
-		// `local`) would be rejected as stale on every push, forever.
-		const meta = { ...merged.meta, remoteVersion: remote.meta.version };
-		// A kept local edit must supersede the remote's version, so it isn't mistaken for (or
-		// stalled behind) the very version it was just merged against.
-		if (meta.dirty && meta.version <= remote.meta.version) {
-			meta.version = remote.meta.version + 1;
-		}
-		return { ...merged, meta };
-	};
-
-	const applyRemote = (
-		records: readonly RecordEnvelope<T>[],
-		opts: ApplyRemoteOptions = {},
-	): void => {
-		assertActive();
-		if (records.length === 0) return;
-		const next: RecordEnvelope<T>[] = [];
-		const bases = new Map<string, RecordEnvelope<T> | undefined>();
-		for (const incoming of records) {
-			if (!bases.has(incoming.id))
-				bases.set(incoming.id, store.get(incoming.id));
-			const local = store.get(incoming.id);
-			// A synced copy getting a remote copy older than the one it already matches (e.g. from
-			// a pull that read the remote just before a push landed there): out of date, so
-			// ignore it -- applying it would roll back a saved change. (For a copy with local
-			// edits, the merge below decides.)
-			const known = local?.meta.remoteVersion;
-			if (
-				local !== undefined &&
-				!local.meta.dirty &&
-				known !== undefined &&
-				incoming.meta.version < known
-			) {
 				continue;
 			}
-			if (local?.meta.dirty) {
-				// Local has un-pushed edits.
-				if (opts.keepPending) continue; // optimistic: keep the local edit until it is pushed
-				const remote = prepareRemote(incoming);
-				if (remote !== undefined) next.push(settleConflict(local, remote)); // resolve now
-				continue;
-			}
-			// Local is clean or missing, so remote wins -- unless nothing actually changed.
-			if (local !== undefined && matchesRemote(local, incoming)) continue;
-			const remote = prepareRemote(incoming);
-			if (remote === undefined) continue;
-			if (local !== undefined && matchesRemote(local, remote)) continue;
-			next.push(withSameDataAs(local, remote));
-		}
-		if (next.length === 0) return;
-		const frozen = next.map((record) => deepFreeze(record));
-		store.setMany(frozen);
-		persistSyncChanges(
-			[...new Map(frozen.map((r) => [r.id, r])).values()].map((r) => ({
-				id: r.id,
-				base: bases.get(r.id),
-				next: r,
-			})),
-		);
-	};
-
-	/** Apply `change` to each dirty record named (skipping unchanged results), then persist. */
-	const updateDirty = (
-		ids: Iterable<string>,
-		change: (current: RecordEnvelope<T>) => RecordEnvelope<T>,
-		ifSuperseded?: SyncChange["ifSuperseded"],
-	): void => {
-		const changes: Array<SyncChange & { next: RecordEnvelope<T> }> = [];
-		for (const id of new Set(ids)) {
-			const current = store.get(id);
-			if (current === undefined || !current.meta.dirty) continue;
-			const next = change(current);
-			if (next !== current) {
-				changes.push({
-					id,
-					base: current,
-					next: deepFreeze(next),
-					...(ifSuperseded !== undefined ? { ifSuperseded } : {}),
-				});
+			const current = visible(key);
+			if (current === undefined || !deepEqual(current.data, result.value)) {
+				changed.set(key, structuredClone(result.value));
 			}
 		}
-		if (changes.length === 0) return;
-		store.setMany(changes.map((c) => c.next));
-		persistSyncChanges(changes);
-	};
-
-	const markSynced = (ids: readonly string[]): void => {
-		assertActive();
-		updateDirty(ids, markRecordSynced);
-	};
-
-	/**
-	 * A local edit made after `sent` was pushed, now that the remote has accepted `sent`: it
-	 * still needs pushing, but it builds on the accepted version -- not the older one it
-	 * started from, which would make its push look like a conflict with this device's own save.
-	 */
-	const onAcceptedVersion = (
-		edit: RecordEnvelope<T>,
-		sent: RecordEnvelope<T>,
-	): RecordEnvelope<T> => {
-		const base = edit.meta.remoteVersion;
-		if (
-			!edit.meta.dirty ||
-			// Only an edit made after `sent` (on one device, versions only grow along a
-			// record's history) -- not an older copy, e.g. from a tab that's behind.
-			edit.meta.version <= sent.meta.version ||
-			(base !== undefined && base >= sent.meta.version)
-		) {
-			return edit;
-		}
-		return {
-			...edit,
-			meta: { ...edit.meta, remoteVersion: sent.meta.version },
-		};
-	};
-
-	const acknowledge = (pushed: readonly RecordEnvelope<T>[]): void => {
-		assertActive();
-		const byId = new Map(pushed.map((r) => [r.id, r]));
-		const sentFor = (id: string) => byId.get(id) as RecordEnvelope<T>;
-		updateDirty(
-			byId.keys(),
-			(current) => {
-				const sent = sentFor(current.id);
-				return current === sent
-					? markRecordSynced(current)
-					: onAcceptedVersion(current, sent);
-			},
-			// Another tab stored a newer edit meanwhile: the same applies to it.
-			(stored) => {
-				const next = onAcceptedVersion(stored, sentFor(stored.id));
-				return next === stored ? undefined : next;
-			},
-		);
-	};
-
-	const hardRemove = (ids: string[]): void => {
-		if (ids.length === 0) return;
-		const bases = ids.map((id) => ({
-			id,
-			base: store.get(id),
-			next: undefined,
-		}));
-		store.removeMany(ids);
-		persistSyncChanges(bases);
-	};
-
-	const purgeDeleted = (): string[] => {
-		assertActive();
-		// Only drop tombstones that the remote already knows about (synced).
-		const purged = store
-			.getAll()
-			.filter((r) => r.meta.deleted && !r.meta.dirty)
-			.map((r) => r.id);
-		hardRemove(purged);
-		return purged;
-	};
-
-	const removeUnseen = (seenIds: ReadonlySet<string>): string[] => {
-		assertActive();
-		const removed = store
-			.getAll()
-			.filter((r) => !r.meta.dirty && !seenIds.has(r.id))
-			.map((r) => r.id);
-		hardRemove(removed);
-		return removed;
-	};
-
-	const refreshFromStorage = (ids: readonly string[]): Promise<void> => {
-		if (disposed || ids.length === 0) return Promise.resolve();
-		// Not loaded yet: refresh once loading has finished (its read may predate this change).
-		if (!hydrated) {
-			return load().then(
-				() => refreshFromStorage(ids),
-				() => {},
-			);
-		}
-		// Queued behind this collection's own pending writes, so it can never read (and revert
-		// to) a stored copy older than a write this tab has already made. A record this tab
-		// changes from now until the refresh applies is left alone: that change is newer, and
-		// its own write (queued after this read) will be stored and announced.
-		const before = ids.map((id) => ownChanges.get(id));
-		const refresh = writeChain.then(async () => {
-			const stored = (await storage.readMany(name, ids)) as Array<
-				RecordEnvelope<T> | undefined
-			>;
-			if (disposed) return;
-			const changed: RecordEnvelope<T>[] = [];
-			const removed: string[] = [];
-			ids.forEach((id, i) => {
-				if (ownChanges.get(id) !== before[i]) return;
-				const current = store.get(id);
-				const fresh = stored[i];
-				if (fresh === undefined) {
-					if (current !== undefined) removed.push(id);
-				} else if (current === undefined || !deepEqual(current, fresh)) {
-					changed.push(deepFreeze(withSameDataAs(current, fresh)));
-				}
-			});
-			if (changed.length > 0) store.setMany(changed);
-			if (removed.length > 0) store.removeMany(removed);
-		});
-		writeChain = refresh.catch((err) =>
-			handleError(err, { source: "storage", collection: name }),
-		);
-		return writeChain;
+		commit(changed);
+		removeKeys([...entries.keys()].filter((key) => !values.has(key)));
 	};
 
 	const whenPersisted = async (): Promise<void> => {
 		// Writes can queue more writes (or more can be made meanwhile): wait until it settles.
 		let chain: Promise<void>;
 		do {
-			chain = writeChain;
+			chain = persistChain;
 			await chain;
-		} while (chain !== writeChain);
-	};
-
-	const dispose = (): void => {
-		if (disposed) return;
-		disposed = true;
-		cache.clear();
+		} while (chain !== persistChain);
 	};
 
 	return {
 		name,
 		get ready() {
-			return loadAttempt ?? load();
+			return load();
 		},
 		load,
-		get deviceId() {
-			return deviceId;
-		},
 		get hydrated() {
 			return hydrated;
 		},
@@ -731,18 +469,31 @@ export function createCollection<T extends object>(
 		replace,
 		upsert,
 		delete: remove,
-		peek,
+		peek: visible,
 		get,
 		query,
 		subscribe,
-		dispose,
-		pending,
-		applyRemote,
-		markSynced,
-		acknowledge,
-		removeUnseen,
-		purgeDeleted,
-		refreshFromStorage,
+		dispose() {
+			if (disposed) return;
+			disposed = true;
+			cache.clear();
+		},
 		whenPersisted,
+		pending: () =>
+			[...entries].flatMap(([key, entry]) =>
+				isPending(key, entry) ? [key] : [],
+			),
+		snapshot: () => new Map(entries),
+		mergeRemote,
+		mergeFromTab(changes, removed) {
+			if (disposed) return;
+			absorb(changes as ReadonlyMap<string, Incoming<T>>, false);
+			for (const key of removed) {
+				entries.delete(key);
+				synced.delete(key);
+			}
+			notify(removed);
+		},
+		replaceAll,
 	};
 }

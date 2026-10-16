@@ -34,7 +34,7 @@ const mapArb = fc
 	.array(fc.tuple(fc.constantFrom("k1", "k2", "k3", "k4"), entryArb), {
 		maxLength: 6,
 	})
-	.map((pairs) => new Map(pairs));
+	.map((pairs) => new Map<string, Entry>(pairs));
 
 describe("LWW map merge", () => {
 	it("is commutative", () => {

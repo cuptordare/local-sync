@@ -44,9 +44,9 @@ describe("syncWhenVisible", () => {
 		});
 		app.keyValue<{ v: number }>("items", {
 			remote: {
-				pull: async () => {
+				read: async () => {
 					pulls++;
-					return { records: [] };
+					return { entries: new Map() };
 				},
 			},
 		});

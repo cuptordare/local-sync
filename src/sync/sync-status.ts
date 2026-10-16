@@ -25,8 +25,6 @@ export interface SyncState {
 	pending: number;
 	/** A debounced automatic push is scheduled (changes are about to be saved). */
 	pushScheduled: boolean;
-	/** Pending changes the remote rejected; held back until they're edited again. */
-	rejected: number;
 	/** Epoch ms of the last successful sync, if any. */
 	lastSyncedAt: number | undefined;
 	/** Wall-clock duration of the last successful sync, if any. */
@@ -50,7 +48,6 @@ export function createSyncStatus(initial: Partial<SyncState> = {}): SyncStatus {
 			online: true,
 			pending: 0,
 			pushScheduled: false,
-			rejected: 0,
 			lastSyncedAt: undefined,
 			lastSyncDurationMs: undefined,
 			lastError: undefined,

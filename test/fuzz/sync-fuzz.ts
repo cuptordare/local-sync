@@ -24,10 +24,8 @@ import { describe, it } from "node:test";
 import type { LocalSyncApp } from "../../src/app/create-local-sync-app.js";
 import { createLocalSyncApp } from "../../src/app/create-local-sync-app.js";
 import type { KeyValueStore } from "../../src/app/key-value-store.js";
-import type { TabChannel } from "../../src/network/multi-tab-sync.js";
-import { createInMemoryChannelHub } from "../../src/network/multi-tab-sync.js";
-import type { RecordEnvelope } from "../../src/records/record-envelope.js";
-import { lastWriteWins, serverWins } from "../../src/records/record-merge.js";
+import type { TabChannel } from "../../src/network/tab-channel.js";
+import { createInMemoryChannelHub } from "../../src/network/tab-channel.js";
 import { createMemoryAdapter } from "../../src/storage/memory-adapter.js";
 import type { StorageAdapter } from "../../src/storage/storage-adapter.js";
 import { createBlobSyncAdapter } from "../../src/sync/adapters/blob-sync-adapter.js";
@@ -118,14 +116,9 @@ function slowStorage(
 		};
 	return {
 		...inner,
-		read: slow(inner.read),
 		readAll: slow(inner.readAll),
-		write: slow(inner.write),
-		writeMany: slow(inner.writeMany),
+		merge: slow(inner.merge),
 		remove: slow(inner.remove),
-		...(inner.readMany ? { readMany: slow(inner.readMany) } : {}),
-		...(inner.removeMany ? { removeMany: slow(inner.removeMany) } : {}),
-		...(inner.update ? { update: slow(inner.update) } : {}),
 	};
 }
 
@@ -135,28 +128,24 @@ async function runScenario(seed: number, steps: number): Promise<void> {
 	const log: string[] = [];
 	const errors: unknown[] = [];
 
-	const merge = random.chance(0.5) ? "lastWriteWins" : "serverWins";
-	// Like many APIs, the server may answer a push with its own copy of each saved record.
-	const echoRecords = random.chance(0.5);
-	log.push(`merge: ${merge}, push returns records: ${echoRecords}`);
 	const server = createFakeBlobServer<Item>({ cas: true });
 	let serverDown = false;
 	let repliesLost = false;
-	const remoteFor = (): SyncAdapter<Item> => {
-		const blob = createBlobSyncAdapter<Item>({
+	const remoteFor = (): SyncAdapter<Item> =>
+		createBlobSyncAdapter<Item>({
 			async read() {
 				await wait(latency.int(8));
 				if (serverDown) throw new Error("server down");
 				// An empty server still has an etag (as the adapter docs ask).
-				return (await server.read()) ?? { records: [], etag: "0" };
+				return server.read();
 			},
 			async write(next, options) {
 				await wait(latency.int(8));
 				if (serverDown) throw new Error("server down");
 				if (TRACE !== undefined) {
-					const r = next.records.find((x) => x.id === TRACE);
+					const e = next.entries[TRACE];
 					log.push(
-						`    [server write] ${r?.data.v} v${r?.meta.version}${r?.meta.deleted ? " deleted" : ""}`,
+						`    [server write] ${e?.deleted ? "deleted" : (e?.value as Item | undefined)?.v} @${e?.stamp}/${e?.device}`,
 					);
 				}
 				const result = await server.write(next, options);
@@ -167,26 +156,6 @@ async function runScenario(seed: number, steps: number): Promise<void> {
 				return result;
 			},
 		});
-		return {
-			pull: (args) => blob.pull(args),
-			async push(mutations) {
-				const result = await (blob.push as NonNullable<typeof blob.push>)(
-					mutations,
-				);
-				if (!echoRecords) return result;
-				const acked = new Set(result.acked);
-				const ids = new Set(
-					mutations
-						.filter((m) => acked.has(m.mutationId))
-						.map((m) => m.recordId),
-				);
-				return {
-					...result,
-					records: structuredClone(server.records.filter((r) => ids.has(r.id))),
-				};
-			},
-		};
-	};
 
 	const history = new Map<string, KeyHistory>();
 	const historyOf = (key: string): KeyHistory => {
@@ -243,21 +212,19 @@ async function runScenario(seed: number, steps: number): Promise<void> {
 		});
 		const items = app.keyValue<Item>("items", {
 			remote: remoteFor(),
-			merge:
-				merge === "lastWriteWins" ? lastWriteWins<Item>() : serverWins<Item>(),
 			pushDebounceMs: random.pick([0, 1, 3]),
 			retry: { maxAttempts: 1 },
 		});
-		// What this tab has received for each key: a value, or null for a tombstone. A key it
-		// has no record of at all is missing (it hasn't heard of that key).
+		// What this tab has received for each key: a value, or null for a delete. A key it
+		// has no entry for at all is missing (it hasn't heard of that key).
 		const known = new Map<string, string | null>();
 		items.collection.subscribe(({ changes }) => {
 			for (const c of changes) {
-				if (c.record === undefined) known.delete(c.id);
+				if (c.kind === "removed") known.delete(c.id);
 				else
 					known.set(
 						c.id,
-						c.record.meta.deleted ? null : (c.record.data as Item).v,
+						c.kind === "deleted" ? null : (c.record?.data.v ?? null),
 					);
 			}
 		});
@@ -265,17 +232,13 @@ async function runScenario(seed: number, steps: number): Promise<void> {
 			items.collection.subscribe(({ changes }) => {
 				for (const c of changes) {
 					if (c.id !== TRACE) continue;
-					const m = c.record?.meta;
+					const e = items.collection.snapshot().get(c.id);
+					const pending = items.collection.pending().includes(c.id);
 					log.push(
-						`    [${id}] ${c.record === undefined ? "removed" : `${(c.record.data as Item | undefined)?.v} v${m?.version} rv${m?.remoteVersion} ${m?.dirty ? "dirty" : "clean"}${m?.deleted ? " deleted" : ""}`}`,
+						`    [${id}] ${c.kind} ${c.record?.data.v ?? ""} @${e?.stamp}/${e?.device}${pending ? " pending" : ""}`,
 					);
 				}
 			});
-			for (const event of ["conflict", "push:rejected"] as const) {
-				items.engine?.on(event, (e) => {
-					if (e.id === TRACE) log.push(`    [${id}] ${event}: ${e.reason}`);
-				});
-			}
 		}
 		return { id, app, items, known };
 	};
@@ -409,11 +372,7 @@ async function runScenario(seed: number, steps: number): Promise<void> {
 		);
 	};
 	const liveServerValues = (): Map<string, string> =>
-		new Map(
-			server.records
-				.filter((r: RecordEnvelope<Item>) => !r.meta.deleted)
-				.map((r) => [r.id, r.data.v]),
-		);
+		new Map([...server.values()].map(([key, item]) => [key, item.v]));
 	const sameEntries = (
 		entries: Array<[string, Item]>,
 		expected: Map<string, string>,
@@ -436,7 +395,7 @@ async function runScenario(seed: number, steps: number): Promise<void> {
 				`${tab.id} never loaded`,
 			);
 			assert.deepEqual(
-				tab.items.collection.pending().map((r) => r.id),
+				tab.items.collection.pending(),
 				[],
 				`${tab.id} still has unpushed changes`,
 			);
@@ -448,18 +407,23 @@ async function runScenario(seed: number, steps: number): Promise<void> {
 		}
 		// 2. Durability: storage matches memory.
 		for (const [d, device] of devices.entries()) {
-			const stored = (await device.storage.readAll("items")).filter(
-				(r) => !r.meta.deleted,
+			const stored = [...(await device.storage.readAll("items"))];
+			const storedView = new Map(
+				stored.flatMap(([key, { entry }]) =>
+					entry.deleted ? [] : [[key, (entry.value as Item).v]],
+				),
 			);
-			const storedView = new Map(stored.map((r) => [r.id, (r.data as Item).v]));
 			assert.deepEqual(
 				storedView,
 				serverView,
 				`device d${d}'s storage differs`,
 			);
 			assert.ok(
-				stored.every((r) => !r.meta.dirty),
-				`device d${d}'s storage has records still marked unpushed`,
+				stored.every(
+					([, { entry, synced }]) =>
+						synced?.stamp === entry.stamp && synced.device === entry.device,
+				),
+				`device d${d}'s storage has entries still marked unpushed`,
 			);
 		}
 		// 3. No invented data. 4. No lost edits: the final value is the last write, or one that
@@ -490,7 +454,7 @@ async function runScenario(seed: number, steps: number): Promise<void> {
 		const message = error instanceof Error ? error.message : String(error);
 		throw new Error(
 			`seed ${seed}: ${message}\n` +
-				`server: ${JSON.stringify(server.records.map((r) => [r.id, r.data.v, r.meta.version, r.meta.deleted]))}\n` +
+				`server: ${JSON.stringify(Object.entries(server.entries).map(([k, e]) => [k, e.deleted ? null : e.value?.v, e.stamp, e.device]))}\n` +
 				`operations:\n${log.join("\n")}`,
 			{ cause: error },
 		);

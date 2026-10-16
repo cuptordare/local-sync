@@ -1,41 +1,50 @@
 /**
- * A SyncAdapter for "one JSON blob per collection" backends: a Google Sheets cell behind an
- * Apps Script, a gist, an S3 object, a KV store entry... You supply `read` and `write` for
- * the whole blob; this adapter does the careful part:
+ * A SyncAdapter for "one JSON document per collection" backends: a Google Sheets cell behind
+ * an Apps Script, a gist, an S3 object, a KV store entry... You supply `read` and `write` for
+ * the whole document; this adapter defines its format and checks what comes back. The sync
+ * engine does the merging, so every save keeps other devices' entries.
  *
- *   - Read-modify-write: a push re-reads the blob and replaces only the pushed records, so
- *     other clients' records in the same blob are kept.
- *   - Per-record conflict detection: a push based on an outdated copy of a record (someone
- *     else saved it since) is rejected with the current copy, which the sync engine resolves
- *     through the collection's merge strategy -- instead of silently overwriting their change.
- *   - Optional compare-and-swap: if `read` returns an `etag` and `write` honors `ifMatch`,
- *     two clients writing the blob at the same moment can't erase each other's writes; the
- *     loser re-reads and retries. Without it there remains a small window (between this
- *     adapter's read and write) where a simultaneous write by another client can be lost.
+ * The document is `{ format: "lww-1", entries: { [key]: { value, deleted, stamp, device } } }`
+ * (see crdt/lww-map.ts). Deletes stay in it as entries with `deleted: true`, so other devices
+ * learn about them.
  *
- * The blob format is `{ records: RecordEnvelope[] }`. Deletes are stored as tombstones
- * (`meta.deleted`) so other clients learn about them. Pulls are NOT snapshots: an empty or
- * reset blob never wipes local data.
+ * If `read` returns an `etag` and `write` honors `ifMatch`, two devices saving at the same
+ * moment can't overwrite each other: the second write is refused, and that device reads,
+ * merges and tries again.
+ *
+ * `legacy`: the document an older version of this library saved (`{ records: [...] }`). While
+ * the new document is empty, its records are imported (see migration/legacy.ts) and saved
+ * into the new document with the next push. Keep the two apart: an older app version reading
+ * a document in the new format would see no records, and save over it.
  *
  * @example
  *   const remote = createBlobSyncAdapter<Todo>({
- *     read: () => api.get("todos"),                               // -> { records, etag? } | null
- *     write: (blob, { ifMatch }) => api.set("todos", blob, ifMatch), // -> void | { conflict: true }
+ *     read: () => api.get("todos:lww"),                                   // -> { format, entries, etag? } | null
+ *     write: (blob, { ifMatch }) => api.set("todos:lww", blob, ifMatch),  // -> void | { conflict: true }
+ *     legacy: { read: () => api.get("todos") },                           // optional
  *   });
- *   const todos = app.keyValue<Todo>("todos", { remote });
  */
-import type { RecordEnvelope } from "../../records/record-envelope.js";
-import { deepEqual } from "../../utils/deep-equal.js";
-import type {
-	Mutation,
-	PushRejection,
-	PushResult,
-	SyncAdapter,
-} from "../sync-adapter.js";
+import type { Entry } from "../../crdt/lww-map.js";
+import { isEntry } from "../../crdt/lww-map.js";
+import {
+	fromLegacyRecords,
+	legacyBlobRecords,
+} from "../../migration/legacy.js";
+import type { RemoteState, SyncAdapter } from "../sync-adapter.js";
 
+export const BLOB_FORMAT = "lww-1";
+
+/** The document saved for a collection. */
+export interface LwwBlob<T> {
+	format: typeof BLOB_FORMAT;
+	entries: Record<string, Entry<T>>;
+}
+
+/** What `read` returns: the saved document, plus its etag if the backend has one. */
 export interface BlobSnapshot<T> {
-	records: RecordEnvelope<T>[];
-	/** An opaque version of the whole blob, for compare-and-swap writes (optional). */
+	format?: typeof BLOB_FORMAT;
+	entries?: Record<string, Entry<T>>;
+	/** An opaque version of the whole document, for compare-and-swap writes (optional). */
 	etag?: string;
 }
 
@@ -53,144 +62,90 @@ export type BlobWriteResult = void | { conflict: true };
 
 export interface BlobSyncAdapterOptions<T> {
 	/**
-	 * Read the whole blob. Return `null`/`undefined` if it doesn't exist yet. A bare array of
-	 * records is accepted too. Throw on any failure (e.g. a non-OK HTTP response). If your
-	 * backend supports etags, return one even for a missing blob (e.g. `{ records: [],
-	 * etag: "0" }`) -- with no etag, the first write can't be checked for a concurrent one.
+	 * Read the whole document. Return `null`/`undefined` if it doesn't exist yet. Throw on any
+	 * failure (e.g. a non-OK HTTP response) -- never return an empty document for a failed
+	 * read. If your backend supports etags, return one even for a missing document (e.g.
+	 * `{ etag: "0" }`), so the first write can be checked too.
 	 */
-	read(): Promise<BlobSnapshot<T> | RecordEnvelope<T>[] | null | undefined>;
-	/** Replace the whole blob. Return `{ conflict: true }` if an `ifMatch` precondition failed. */
-	write(
-		blob: { records: RecordEnvelope<T>[] },
-		options: BlobWriteOptions,
-	): Promise<BlobWriteResult>;
-	/** How many times to re-read and retry after a compare-and-swap conflict. Default 3. */
-	maxConflictRetries?: number;
+	read(): Promise<BlobSnapshot<T> | null | undefined>;
+	/** Replace the whole document. Return `{ conflict: true }` if an `ifMatch` precondition failed. */
+	write(blob: LwwBlob<T>, options: BlobWriteOptions): Promise<BlobWriteResult>;
+	/**
+	 * Where an older version of the library saved this collection (`{ records: [...] }`), to
+	 * import while the new document is empty. It's only read, never written.
+	 */
+	legacy?: { read(): Promise<unknown> };
 }
 
-function isEnvelopeArray(value: unknown): value is RecordEnvelope<unknown>[] {
-	return (
-		Array.isArray(value) &&
-		value.every(
-			(r) =>
-				typeof r === "object" &&
-				r !== null &&
-				typeof (r as RecordEnvelope<unknown>).id === "string" &&
-				typeof (r as RecordEnvelope<unknown>).meta === "object",
-		)
-	);
-}
+const describe = (value: unknown): string =>
+	(JSON.stringify(value) ?? String(value)).slice(0, 200);
 
-/** Store records in the blob as plain remote data (client-only bookkeeping stripped). */
-function toBlobRecord<T>(record: RecordEnvelope<T>): RecordEnvelope<T> {
-	const { remoteVersion: _client, ...meta } = record.meta;
-	return {
-		id: record.id,
-		data: record.data,
-		meta: { ...meta, dirty: false, source: "remote" },
-	};
-}
-
-function sameContent<T>(a: RecordEnvelope<T>, b: RecordEnvelope<T>): boolean {
-	return deepEqual(a.data, b.data) && a.meta.deleted === b.meta.deleted;
-}
-
-/**
- * Whether the remote changed this record since the local edit's base. Records written before
- * `remoteVersion` existed have no base; for those, the edit is accepted only if it is ahead of
- * the remote (the version history the engine always relied on).
- */
-function isStale<T>(
-	local: RecordEnvelope<T>,
-	remote: RecordEnvelope<T>,
-): boolean {
-	if (sameContent(local, remote)) return false; // nothing to lose
-	const base = local.meta.remoteVersion;
-	return base === undefined
-		? local.meta.version <= remote.meta.version
-		: base !== remote.meta.version;
+function parse<T>(raw: BlobSnapshot<T> | null | undefined): {
+	entries: Map<string, Entry<T>>;
+	etag?: string;
+} {
+	if (raw === null || raw === undefined) return { entries: new Map() };
+	if (typeof raw !== "object" || Array.isArray(raw)) {
+		throw new Error(`Blob read returned an unexpected shape: ${describe(raw)}`);
+	}
+	const etag = typeof raw.etag === "string" ? raw.etag : undefined;
+	const withEtag = <R extends object>(result: R) =>
+		etag === undefined ? result : { ...result, etag };
+	if (raw.format === undefined && "records" in raw) {
+		throw new Error(
+			"Blob read returned a document in the old { records } format. Save the new format " +
+				"under a new name, and pass the old one's reader as `legacy` to import it.",
+		);
+	}
+	if (raw.format !== undefined && raw.format !== BLOB_FORMAT) {
+		throw new Error(
+			`Blob read returned format ${describe(raw.format)}, but this version of the ` +
+				`library reads "${BLOB_FORMAT}" (was it saved by a newer version?)`,
+		);
+	}
+	if (raw.entries === undefined) return withEtag({ entries: new Map() });
+	if (typeof raw.entries !== "object" || raw.entries === null) {
+		throw new Error(`Blob read returned an unexpected shape: ${describe(raw)}`);
+	}
+	const entries = new Map<string, Entry<T>>();
+	for (const [key, entry] of Object.entries(raw.entries)) {
+		// e.g. an `{ error: "..." }` body from a failing backend -- never treat that as data.
+		if (!isEntry(entry)) {
+			throw new Error(
+				`Blob read returned a malformed entry for "${key}": ${describe(entry)}`,
+			);
+		}
+		entries.set(key, entry as Entry<T>);
+	}
+	return withEtag({ entries });
 }
 
 export function createBlobSyncAdapter<T>(
 	options: BlobSyncAdapterOptions<T>,
-): SyncAdapter<T> {
-	const maxConflictRetries = options.maxConflictRetries ?? 3;
-
-	const readBlob = async (): Promise<BlobSnapshot<T>> => {
-		const raw = await options.read();
-		if (raw === null || raw === undefined) return { records: [] };
-		if (isEnvelopeArray(raw)) return { records: raw as RecordEnvelope<T>[] };
-		if (
-			typeof raw === "object" &&
-			isEnvelopeArray((raw as BlobSnapshot<T>).records)
-		) {
-			return raw as BlobSnapshot<T>;
-		}
-		// e.g. an `{ error: "..." }` body from a failing backend -- never treat that as data.
-		throw new Error(
-			`Blob read returned an unexpected shape: ${JSON.stringify(raw).slice(0, 200)}`,
-		);
-	};
-
+): Required<SyncAdapter<T>> {
 	return {
-		async pull() {
-			const { records } = await readBlob();
-			return { records };
+		async read(): Promise<RemoteState<T>> {
+			const state: RemoteState<T> = parse(await options.read());
+			if (state.entries.size > 0 || options.legacy === undefined) return state;
+			const old = await options.legacy.read();
+			if (old === null || old === undefined) return state;
+			const records = legacyBlobRecords(old);
+			if (records === undefined) {
+				throw new Error(
+					`Legacy blob read returned an unexpected shape: ${describe(old)}`,
+				);
+			}
+			return {
+				...state,
+				imported: fromLegacyRecords(records) as Map<string, Entry<T>>,
+			};
 		},
 
-		async push(mutations: Mutation<T>[]): Promise<PushResult<T>> {
-			for (let attempt = 0; ; attempt++) {
-				const { records, etag } = await readBlob();
-				const current = new Map(records.map((r) => [r.id, r]));
-				const acked: string[] = [];
-				const rejected: PushRejection<T>[] = [];
-				// Acked without a write: the remote already has this content, at this version or
-				// a later one. Its copy goes back, so the client takes its (later) version.
-				const alreadyThere: RecordEnvelope<T>[] = [];
-				let changed = false;
-
-				for (const mutation of mutations) {
-					const remote = current.get(mutation.recordId);
-					if (remote !== undefined && isStale(mutation.record, remote)) {
-						rejected.push({
-							mutationId: mutation.mutationId,
-							reason:
-								"The record was changed by someone else since it was last synced",
-							record: remote,
-						});
-						continue;
-					}
-					acked.push(mutation.mutationId);
-					if (
-						remote !== undefined &&
-						sameContent(mutation.record, remote) &&
-						remote.meta.version >= mutation.record.meta.version
-					) {
-						// Never move the remote's version backwards (e.g. a stale copy re-sent).
-						alreadyThere.push(remote);
-						continue;
-					}
-					current.set(mutation.recordId, toBlobRecord(mutation.record));
-					changed = true;
-				}
-
-				const response: PushResult<T> = {
-					acked,
-					rejected,
-					...(alreadyThere.length > 0 ? { records: alreadyThere } : {}),
-				};
-				if (!changed) return response;
-				const result = await options.write(
-					{ records: [...current.values()] },
-					etag === undefined ? {} : { ifMatch: etag },
-				);
-				if (result?.conflict !== true) return response;
-				if (attempt >= maxConflictRetries) {
-					throw new Error(
-						`Blob write kept conflicting after ${maxConflictRetries + 1} attempts (it is being changed concurrently)`,
-					);
-				}
-			}
+		async write(entries, { ifMatch }) {
+			return options.write(
+				{ format: BLOB_FORMAT, entries: Object.fromEntries(entries) },
+				ifMatch === undefined ? {} : { ifMatch },
+			);
 		},
 	};
 }

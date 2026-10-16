@@ -17,7 +17,6 @@ import { createCollection } from "../collections/create-collection.js";
 import type { Listener, Unsubscribe } from "../events/event-types.js";
 import type { NetworkStatus } from "../network/network-status.js";
 import { createNetworkStatus } from "../network/network-status.js";
-import type { MergeFactory, MergeStrategy } from "../records/record-merge.js";
 import type { Validator } from "../records/record-validation.js";
 import type { StorageAdapter } from "../storage/storage-adapter.js";
 import { createSyncEngine } from "../sync/create-sync-engine.js";
@@ -40,14 +39,10 @@ import type { AppSyncStatus } from "./app-status.js";
 import { createAppSyncStatus } from "./app-status.js";
 import type { KeyValueStore } from "./key-value-store.js";
 import { createKeyValueStore } from "./key-value-store.js";
-import type {
-	ReadonlyCollection,
-	Source,
-	SourceAdapterOptions,
-} from "./source.js";
+import type { Source, SourceAdapterOptions } from "./source.js";
 import {
 	createSource,
-	createSourceAdapter,
+	createSourceEngine,
 	toReadonlyCollection,
 } from "./source.js";
 
@@ -70,27 +65,17 @@ export interface ManagedSyncOptions {
 
 /** Per-collection settings for `app.collection(name, config)`. */
 export interface CollectionConfig<T extends object> extends ManagedSyncOptions {
-	/** Write-time validation (also applied to data arriving from the remote). */
+	/** Validation for local writes (which throw), and for values from elsewhere (hidden if invalid). */
 	validator?: Validator<T>;
-	/** Conflict-resolution strategy for this collection (overrides the app default). */
-	merge?: MergeStrategy<T>;
 	/** Sync this collection through this adapter; the app creates and runs the engine. */
-	// biome-ignore lint/suspicious/noExplicitAny: adapters may use any Filter/Cursor types
-	remote?: SyncAdapter<T, any, any>;
-	/**
-	 * Keep un-pushed local edits when a pull brings newer remote data (default true). See
-	 * `CreateSyncEngineOptions.keepPendingOnPull`.
-	 */
-	keepPendingOnPull?: boolean;
+	remote?: SyncAdapter<T>;
 }
 
 export interface KeyValueOptions<T extends object> extends ManagedSyncOptions {
 	/** Sync these values through this adapter (e.g. `createBlobSyncAdapter(...)`). */
 	remote?: SyncAdapter<T>;
-	/** Validation for stored values (also applied to data arriving from the remote). */
+	/** Validation for local writes (which throw), and for values from elsewhere (hidden if invalid). */
 	validator?: Validator<T>;
-	/** Conflict-resolution strategy (overrides the app default). */
-	merge?: MergeStrategy<T>;
 }
 
 export interface SourceOptions<T extends object, Filter, Cursor>
@@ -115,8 +100,6 @@ export interface CreateLocalSyncAppOptions {
 	name?: string;
 	/** Persistence backend. Defaults to IndexedDB when `name` is set in a browser, else memory. */
 	storage?: StorageAdapter;
-	/** App-wide default merge strategy (e.g. `lastWriteWins()`) or factory. Defaults to `serverWins()`. */
-	merge?: MergeFactory | MergeStrategy<unknown>;
 	/** Injectable clock (epoch ms). Defaults to the shared `now()`. */
 	now?: () => number;
 	/**
@@ -170,7 +153,7 @@ export interface LocalSyncApp {
 	hasCollection(name: string): boolean;
 	/** Names of all registered collections. */
 	readonly collections: readonly string[];
-	/** Resolve once all currently-registered collections have loaded from storage. */
+	/** Resolve once all currently-registered collections have loaded from storage (retrying any that failed). */
 	ready(): Promise<void>;
 	/**
 	 * Sync every app-managed remote now (push, then pull). Rejects if any failed (after all
@@ -241,8 +224,8 @@ export function createLocalSyncApp(
 			typeof indexedDB !== "undefined";
 		if (setting === undefined && !sharesStorage) return undefined;
 		return createAppMultiTab(options.name ?? "app", multiTabOptions, {
-			onChanged: (collection, ids) =>
-				void ctx.registry.get(collection)?.collection.refreshFromStorage(ids),
+			onEntries: (collection, changes, removed) =>
+				ctx.registry.get(collection)?.collection.mergeFromTab(changes, removed),
 			onLeaderStatus: (state) => status.setOverride(state),
 			onBecameLeader() {
 				followerSynced.clear();
@@ -279,7 +262,7 @@ export function createLocalSyncApp(
 		}
 		const onVisibilityChange = (): void => {
 			if (document.visibilityState !== "visible" || ctx.disposed) return;
-			const now = ctx.clock();
+			const now = ctx.now();
 			for (const registration of ctx.registry.values()) {
 				const { engine } = registration;
 				if (engine === undefined || registration.startOptions === undefined)
@@ -303,6 +286,8 @@ export function createLocalSyncApp(
 		kind: RegistrationKind,
 		name: string,
 		config: CollectionConfig<T>,
+		/** The engine for a collection that doesn't sync through a `remote` (a source). */
+		makeEngine?: (collection: Collection<T>) => SyncEngine<never>,
 	): Registration => {
 		const collection = createCollection<T>({
 			name,
@@ -310,38 +295,33 @@ export function createLocalSyncApp(
 			...(config.validator !== undefined
 				? { validator: config.validator }
 				: {}),
-			merge: config.merge ?? ctx.mergeFactory<T>(),
-			now: ctx.clock,
+			clock: ctx.clock,
+			writerId: ctx.writerId,
 			onError: (error: unknown, info: CollectionErrorInfo) =>
 				ctx.report({ ...info, error }),
 			...(multiTab !== undefined
 				? {
-						onPersist: (ids: readonly string[]) =>
-							multiTab.announceChanged(name, ids),
-						sharedStorage: true,
+						onPersist: (changes, removed) =>
+							multiTab.announceEntries(name, changes, removed),
 					}
 				: {}),
 		});
 
-		let engine: SyncEngine<never> | undefined;
-		if (config.remote !== undefined) {
-			const created = createSyncEngine<T, unknown, unknown>({
-				collection,
-				adapter: config.remote,
-				network: getNetwork(),
-				now: ctx.clock,
-				...(config.retry !== undefined ? { retry: config.retry } : {}),
-				...(config.keepPendingOnPull !== undefined
-					? { keepPendingOnPull: config.keepPendingOnPull }
-					: {}),
-			});
-			created.on("sync:error", ({ error }) =>
+		const engine =
+			makeEngine?.(collection) ??
+			(config.remote === undefined
+				? undefined
+				: (createSyncEngine<T>({
+						collection,
+						adapter: config.remote,
+						network: getNetwork(),
+						now: ctx.now,
+						...(config.retry !== undefined ? { retry: config.retry } : {}),
+					}) as SyncEngine<never>));
+		if (engine !== undefined) {
+			engine.on("sync:error", ({ error }) =>
 				ctx.report({ source: "sync", collection: name, error }),
 			);
-			created.on("conflict", ({ id, reason }) =>
-				ctx.events.emit("conflict", { collection: name, id, reason }),
-			);
-			engine = created as SyncEngine<never>;
 			status.track(name, engine);
 		}
 
@@ -440,37 +420,27 @@ export function createLocalSyncApp(
 			assertOpen();
 			const found = existing("source", name, undefined, false);
 			if (found !== undefined) return found.handle as Source<T, Filter>;
-			// The adapter reads cached items (to keep versions stable) from the collection that
-			// is only created with it, so it looks them up through this late-bound view.
-			let view: ReadonlyCollection<T> | undefined;
-			const adapter = createSourceAdapter<T, Filter, Cursor>(
+			const registration = register<T>(
+				"source",
 				name,
-				(id) => view?.peek(id),
-				sourceOptions,
-				ctx.clock,
-				sourceOptions.validator,
+				{
+					...(sourceOptions.validator !== undefined
+						? { validator: sourceOptions.validator }
+						: {}),
+					// Started below.
+					autoSync: false,
+				},
+				(collection) =>
+					createSourceEngine<T, Filter, Cursor>(name, collection, {
+						...sourceOptions,
+						network: getNetwork(),
+						now: ctx.now,
+					}) as unknown as SyncEngine<never>,
 			);
-			const registration = register<T>("source", name, {
-				remote: adapter,
-				...(sourceOptions.validator !== undefined
-					? { validator: sourceOptions.validator }
-					: {}),
-				...(sourceOptions.retry !== undefined
-					? { retry: sourceOptions.retry }
-					: {}),
-				...(sourceOptions.refreshIntervalMs !== undefined
-					? { syncIntervalMs: sourceOptions.refreshIntervalMs }
-					: {}),
-				// Start only after the initial filter is set below.
-				autoSync: false,
-			});
 			const engine = registration.engine as unknown as SyncEngine<Filter>;
-			view = toReadonlyCollection(
+			const view = toReadonlyCollection(
 				registration.collection as unknown as Collection<T>,
 			);
-			if (sourceOptions.filter !== undefined) {
-				engine.setFilter(sourceOptions.filter);
-			}
 			if (sourceOptions.autoSync ?? true) {
 				registration.startOptions = {
 					syncOnStart: true,
@@ -498,7 +468,7 @@ export function createLocalSyncApp(
 
 		async ready() {
 			await Promise.all(
-				[...ctx.registry.values()].map((r) => r.collection.ready),
+				[...ctx.registry.values()].map((r) => r.collection.load()),
 			);
 		},
 
