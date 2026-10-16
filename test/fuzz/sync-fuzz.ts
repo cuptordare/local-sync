@@ -125,6 +125,8 @@ function slowStorage(
 async function runScenario(seed: number, steps: number): Promise<void> {
 	const random = createRandom(seed);
 	const latency = createRandom(seed ^ 0x9e3779b9);
+	// Each device's clock is off by up to 2 seconds, as real devices' clocks are.
+	const skews = createRandom(seed ^ 0x5bd1e995);
 	const log: string[] = [];
 	const errors: unknown[] = [];
 
@@ -184,6 +186,8 @@ async function runScenario(seed: number, steps: number): Promise<void> {
 		known: ReadonlyMap<string, string | null>;
 	}
 	interface Device {
+		/** How far this device's clock is off, in ms. */
+		skew: number;
 		storage: StorageAdapter;
 		network: ReturnType<typeof createFakeNetworkStatus>;
 		hub: ReturnType<typeof createInMemoryChannelHub>;
@@ -202,6 +206,7 @@ async function runScenario(seed: number, steps: number): Promise<void> {
 			},
 		};
 		const app = createLocalSyncApp({
+			now: () => Date.now() + device.skew,
 			storage,
 			network: device.network,
 			multiTab: {
@@ -245,6 +250,7 @@ async function runScenario(seed: number, steps: number): Promise<void> {
 
 	const devices: Device[] = Array.from({ length: DEVICES }, (_, d) => {
 		const device: Device = {
+			skew: skews.int(4001) - 2000,
 			storage: createMemoryAdapter(),
 			network: createFakeNetworkStatus(true),
 			hub: createInMemoryChannelHub(),
