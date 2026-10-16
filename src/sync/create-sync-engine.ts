@@ -70,13 +70,20 @@ export function createSyncEngine<T extends object>(
 	/** Deletes stamped before this are old enough to forget. */
 	const horizon = () => stampAt(Math.max(0, clock() - ttl));
 
+	/** The last read showed the remote lacking entries this side holds (e.g. it was cleared). */
+	let remoteBehind = false;
+
 	const take = (remote: RemoteState<T>): void => {
 		if (remote.imported !== undefined && remote.imported.size > 0) {
 			collection.mergeRemote(remote.imported); // not on the remote yet: pending
 		}
 		collection.mergeRemote(remote.entries, { synced: true });
-		// A key the remote dropped (an old delete) goes here too.
-		collection.prune(remote.entries, horizon());
+		// A key the remote dropped (an old delete) goes here too. Not if the remote is empty:
+		// that's a new, cleared or lost document (a push only drops old deletes), and this
+		// device's data is pushed back instead.
+		if (remote.entries.size > 0) collection.prune(remote.entries, horizon());
+		remoteBehind =
+			keysNewerIn(collection.snapshot(), remote.entries).length > 0;
 	};
 
 	const write = adapter.write?.bind(adapter);
@@ -111,6 +118,7 @@ export function createSyncEngine<T extends object>(
 								}
 								collection.mergeRemote(saved, { synced: true });
 								collection.prune(merged, cutoff); // the old deletes just dropped
+								remoteBehind = false;
 								return;
 							}
 							if (conflicts + 1 >= MAX_WRITE_CONFLICTS) {
@@ -131,6 +139,7 @@ export function createSyncEngine<T extends object>(
 		},
 		...(push !== undefined ? { push } : {}),
 		pendingCount: () => collection.pending().length,
+		pushNeeded: () => remoteBehind,
 		watch: (onChange) =>
 			collection.subscribe(({ changes }) => {
 				const pending = new Set(collection.pending());
@@ -151,6 +160,8 @@ export interface EngineOperations {
 	push?: () => Promise<void>;
 	/** How many local changes are waiting to be pushed. */
 	pendingCount(): number;
+	/** Whether to push even with nothing pending (the remote lost data this side holds). */
+	pushNeeded?: () => boolean;
 	/** Report local data changes; `pushNeeded` if they include changes to push. */
 	watch(onChange: (pushNeeded: boolean) => void): Unsubscribe;
 	setFilter?(filter: unknown): void;
@@ -239,7 +250,7 @@ export function createEngine<Filter = unknown>(
 		async () => {
 			await ops.load();
 			if (disposed || !guardOnline() || ops.push === undefined) return;
-			if (ops.pendingCount() === 0) {
+			if (ops.pendingCount() === 0 && ops.pushNeeded?.() !== true) {
 				// Nothing left that could fail to push: an earlier push failure no longer applies.
 				if (failures.push !== undefined) {
 					delete failures.push;

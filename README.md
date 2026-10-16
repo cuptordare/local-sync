@@ -361,6 +361,9 @@ logical clock**. Everything else follows from it.
   characters each), then a push drops them, and each device removes the key once its own copy
   is that old too. So a device offline for over 30 days, with an unsaved edit to a key deleted
   meanwhile, brings that key back. (`createSyncEngine`'s `tombstoneTtlMs` changes the 30 days.)
+- **A remote that comes back empty** (its document cleared, lost, or moved) never deletes
+  anything on a device: the next sync pushes the device's data back into it. So does any read
+  showing the remote lacks entries a device holds.
 - **Pull** reads the remote's entries and merges them in. **Push** reads, merges, and if this
   side has entries the remote lacks, writes the merge of both with `ifMatch`; on
   `{ conflict: true }` it reads, merges and tries again.
@@ -414,8 +417,9 @@ The default merge, `mergeValues`:
 | the same field, or anything else, to different values | the later edit wins |
 
 Not merged: an edit against a delete (the later write wins), edits from two tabs of one device
-(they see each other at once), and a merge result your validator refuses (the later write wins,
-and it's reported as an app `"error"`). Lists merged as sets treat equal items as one.
+(they see each other at once), and a merge result your validator refuses or a `merge` function
+that throws (the later write wins, and it's reported as an app `"error"` with
+`source: "merge"`). Lists merged as sets treat equal items as one.
 
 Your own rules go in `merge`, per store; it runs only in that situation, and returns the
 value to save:

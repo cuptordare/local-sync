@@ -31,10 +31,11 @@ function device<T extends object>(
 		retry?: { maxAttempts: number };
 	} = {},
 ) {
+	const errors: string[] = [];
 	const app = createLocalSyncApp({
 		storage: options.storage ?? createMemoryAdapter(),
 		network: createFakeNetworkStatus(true),
-		onError: () => {},
+		onError: (_error, { source }) => errors.push(source),
 	});
 	const merges: LocalSyncMergeEvent[] = [];
 	app.on("merged", (e) => merges.push(e));
@@ -47,7 +48,7 @@ function device<T extends object>(
 			? { validator: fromGuard(options.validator) }
 			: {}),
 	});
-	return { app, store, merges };
+	return { app, store, merges, errors };
 }
 
 async function twoDevices<T extends object>(
@@ -203,6 +204,28 @@ describe("concurrent edits: merged, not lost", () => {
 		await a.app.sync();
 		assert.deepEqual(a.store.get("todo"), { items: ["b1", "b2"] });
 		assert.deepEqual(b.store.get("todo"), { items: ["b1", "b2"] });
+		assert.deepEqual(b.errors, ["merge"]);
+	});
+
+	it("a merge function that throws falls back to the later write, reported as a merge error", async () => {
+		const { a, b } = await twoDevices<Todo>(
+			{ todo: { items: [] } },
+			{
+				merge: () => {
+					throw new Error("can't merge");
+				},
+			},
+		);
+		a.store.set("todo", { items: ["a"] });
+		await a.app.sync();
+		await wait();
+		b.store.set("todo", { items: ["b"] }); // later
+		await b.app.sync();
+		await a.app.sync();
+		assert.deepEqual(a.store.get("todo"), { items: ["b"] });
+		assert.deepEqual(b.store.get("todo"), { items: ["b"] });
+		assert.deepEqual(b.errors, ["merge"]);
+		assert.equal(b.merges.length, 0);
 	});
 
 	it("an edit made offline is still merged after the app is reopened", async () => {

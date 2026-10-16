@@ -9,9 +9,11 @@ export interface LocalSyncErrorEvent {
 	 * `"remote-validation"`: a value from elsewhere (the remote, or another tab) failed the
 	 * collection's validator. It's hidden: reads treat its key as missing until a valid value
 	 * replaces it.
+	 * `"merge"`: combining two concurrent edits failed (the `merge` function threw, or its
+	 * result failed the validator). The later of the two edits is kept instead.
 	 * `"sync"`: a pull or push for an app-managed remote failed (after retries).
 	 */
-	source: "storage" | "remote-validation" | "sync";
+	source: "storage" | "remote-validation" | "merge" | "sync";
 	collection: string;
 	/** The record involved, when known. */
 	id?: string;

@@ -21,8 +21,10 @@ export interface CollectionErrorInfo {
 	 * `"remote-validation"`: a value that came from elsewhere (the remote, another tab, or
 	 * storage) failed the collection's validator. It's kept, so devices still agree, but
 	 * reads treat its key as missing until a valid value replaces it.
+	 * `"merge"`: combining two concurrent edits failed (the `merge` function threw, or its
+	 * result failed the validator). The later of the two edits is kept instead.
 	 */
-	source: "storage" | "remote-validation";
+	source: "storage" | "remote-validation" | "merge";
 	collection: string;
 	/** The record involved, when known. */
 	id?: string;

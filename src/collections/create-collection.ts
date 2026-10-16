@@ -34,7 +34,7 @@ import {
 } from "../crdt/lww-map.js";
 import { mergeValues } from "../crdt/merge-values.js";
 import type { Listener, Unsubscribe } from "../events/event-types.js";
-import { fromLegacyRecords } from "../migration/legacy.js";
+import { fromLegacyRecords, LEGACY_DEVICE } from "../migration/legacy.js";
 import { createReactiveCache } from "../reactivity/reactive-cache.js";
 import type { ReactiveQuery } from "../reactivity/reactive-query.js";
 import { createReactiveQuery } from "../reactivity/reactive-query.js";
@@ -265,6 +265,19 @@ export function createCollection<T extends object>(
 		notify(changed);
 	};
 
+	/** The base for a new edit of `key`, replacing `current` (see `commit`). */
+	const baseFor = (
+		key: string,
+		current: Entry<T> | undefined,
+	): Entry<T> | undefined => {
+		if (current === undefined || !isPending(key, current)) return current;
+		// An imported entry is pending (the remote may not hold it yet), but it isn't an edit:
+		// an edit made from it is based on it.
+		return (
+			bases.get(key) ?? (current.device === LEGACY_DEVICE ? current : undefined)
+		);
+	};
+
 	/**
 	 * Write values (null = delete) as new entries from this tab. Each edit's base is the entry
 	 * it replaces -- or, if that is itself an unsaved edit, that edit's base -- unless given.
@@ -276,11 +289,7 @@ export function createCollection<T extends object>(
 		const incoming = new Map<string, Incoming<T>>();
 		for (const [key, value] of values) {
 			const current = entries.get(key);
-			const base =
-				givenBases?.get(key) ??
-				(current !== undefined && isPending(key, current)
-					? bases.get(key)
-					: current);
+			const base = givenBases?.get(key) ?? baseFor(key, current);
 			const entry: Entry<T> = deepFreeze({
 				value,
 				deleted: value === null,
@@ -493,9 +502,9 @@ export function createCollection<T extends object>(
 			});
 			return merged;
 		} catch (error) {
-			// e.g. the merge result fails the validator: the later write wins instead.
+			// The merge threw, or its result fails the validator: the later write wins instead.
 			handleError(error, {
-				source: "remote-validation",
+				source: "merge",
 				collection: name,
 				id: key,
 			});

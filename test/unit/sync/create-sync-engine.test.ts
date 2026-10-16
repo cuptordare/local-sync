@@ -632,10 +632,32 @@ describe("sync engine: forgetting old deletes", () => {
 		server.put({ format: "lww-1", entries: { k: entry(1, daysAgo(40)) } });
 		await engine.pull();
 		assert.deepEqual(values(collection), { k: 1 });
+		server.put({ format: "lww-1", entries: { other: entry(2, daysAgo(1)) } });
+		await engine.pull();
+		assert.deepEqual(values(collection), { other: 2 });
+		assert.equal(collection.snapshot().has("k"), false);
+	});
+
+	it("a remote that comes back empty (cleared, lost) deletes nothing; the next sync restores it", async () => {
+		const { server, collection, engine } = await setup();
+		server.put({
+			format: "lww-1",
+			entries: {
+				k: entry(1, daysAgo(40)),
+				gone: { value: null, deleted: true, stamp: daysAgo(31), device: "x" },
+			},
+		});
+		await engine.pull();
 		server.put({ format: "lww-1", entries: {} });
 		await engine.pull();
-		assert.deepEqual(values(collection), {});
-		assert.equal(collection.snapshot().has("k"), false);
+		assert.deepEqual(values(collection), { k: 1 });
+		assert.deepEqual(collection.pending(), []); // nothing was edited...
+		await engine.sync(); // ...but the remote lacks data, so it's pushed back
+		assert.deepEqual(Object.keys(server.entries), ["k"]); // (the old delete is dropped)
+		assert.equal(collection.snapshot().has("gone"), false);
+		const writes = server.writes;
+		await engine.sync();
+		assert.equal(server.writes, writes); // and only once
 	});
 
 	it("keeps (and pushes) an unsaved edit, and a recent value a stale read hasn't seen", async () => {

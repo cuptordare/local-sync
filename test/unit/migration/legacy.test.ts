@@ -274,6 +274,22 @@ describe("importing the old remote row", () => {
 		});
 		await Promise.all([d1.app.close(), d2.app.close()]);
 	});
+
+	it("an edit of an imported value, made before the first sync, isn't merged with that value", async () => {
+		const newRow = createFakeBlobServer<Todo>({ cas: true });
+		const d1 = device(newRow, oldRow);
+		await d1.app.ready();
+		await d1.app.sync(); // d1 upgraded first: the new row holds the imported records
+		// d2 upgrades later, with the same records stored, and edits before its first sync.
+		const d2 = device(newRow, oldRow, { todo: oldRow.records });
+		await d2.app.ready();
+		d2.todo.set("todo:shared", { items: ["milk"] }); // removes eggs
+		await d2.app.sync();
+		await d1.app.sync();
+		assert.deepEqual(d2.todo.get("todo:shared"), { items: ["milk"] });
+		assert.deepEqual(d1.todo.get("todo:shared"), { items: ["milk"] });
+		await Promise.all([d1.app.close(), d2.app.close()]);
+	});
 });
 
 /**
