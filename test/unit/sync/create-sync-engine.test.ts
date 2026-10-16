@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createCollection } from "../../../src/collections/create-collection.js";
+import { stampAt } from "../../../src/crdt/hlc.js";
 import type { Entry } from "../../../src/crdt/lww-map.js";
 import { createMemoryAdapter } from "../../../src/storage/memory-adapter.js";
 import type { StorageAdapter } from "../../../src/storage/storage-adapter.js";
@@ -601,5 +602,85 @@ describe("sync engine: lifecycle", () => {
 		gate.resolve();
 		await syncing;
 		assert.deepEqual(server.values().get("a"), { n: 9 });
+	});
+});
+
+describe("sync engine: forgetting old deletes", () => {
+	const DAY = 24 * 60 * 60 * 1000;
+	const daysAgo = (days: number) => stampAt(Date.now() - days * DAY);
+
+	it("a push drops deletes older than 30 days from the remote, and keeps newer ones", async () => {
+		const { server, collection, engine } = await setup();
+		server.put({
+			format: "lww-1",
+			entries: {
+				old: { value: null, deleted: true, stamp: daysAgo(31), device: "x" },
+				recent: { value: null, deleted: true, stamp: daysAgo(29), device: "x" },
+			},
+		});
+		collection.upsert("a", { n: 1 }); // something to push
+		await engine.push();
+		assert.deepEqual(Object.keys(server.entries).sort(), ["a", "recent"]);
+		assert.deepEqual(collection.pending(), []);
+		assert.equal(collection.snapshot().has("old"), false); // forgotten here too
+	});
+
+	it("a device that was away removes a key whose delete was forgotten meanwhile", async () => {
+		const { server, collection, engine } = await setup();
+		// This device synced a value 40 days ago; since then it was deleted, and the delete
+		// was dropped after 30 days -- so the remote no longer has the key at all.
+		server.put({ format: "lww-1", entries: { k: entry(1, daysAgo(40)) } });
+		await engine.pull();
+		assert.deepEqual(values(collection), { k: 1 });
+		server.put({ format: "lww-1", entries: {} });
+		await engine.pull();
+		assert.deepEqual(values(collection), {});
+		assert.equal(collection.snapshot().has("k"), false);
+	});
+
+	it("keeps (and pushes) an unsaved edit, and a recent value a stale read hasn't seen", async () => {
+		const { server, collection, engine } = await setup();
+		server.put({ format: "lww-1", entries: { k: entry(1, daysAgo(40)) } });
+		await engine.pull();
+		collection.upsert("k", { n: 2 }); // edited here, not saved yet
+		collection.upsert("fresh", { n: 3 });
+		collection.mergeRemote(collection.snapshot(), { synced: true }); // as if just pushed
+		collection.upsert("k", { n: 4 });
+		server.put({ format: "lww-1", entries: {} }); // e.g. a read from before that push
+		await engine.pull();
+		assert.deepEqual(values(collection), { k: 4, fresh: 3 });
+		await engine.push();
+		// ("fresh" goes out again too: a push writes whatever the remote lacks.)
+		assert.deepEqual(Object.fromEntries(server.values()), {
+			k: { n: 4 },
+			fresh: { n: 3 },
+		});
+	});
+
+	it("an old delete that was never pushed is dropped too, without being written", async () => {
+		const storage = createMemoryAdapter();
+		await storage.merge(
+			"items",
+			new Map([
+				[
+					"k",
+					{
+						entry: {
+							value: null,
+							deleted: true,
+							stamp: daysAgo(45),
+							device: "me",
+						},
+					},
+				],
+			]),
+		);
+		const { server, collection, engine } = await setup({ storage });
+		collection.upsert("a", { n: 1 });
+		await engine.push();
+		await engine.pull();
+		assert.deepEqual(Object.keys(server.entries), ["a"]);
+		assert.equal(collection.snapshot().has("k"), false);
+		assert.deepEqual(collection.pending(), []);
 	});
 });

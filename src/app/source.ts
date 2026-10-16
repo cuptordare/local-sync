@@ -210,6 +210,7 @@ export function toReadonlyCollection<T extends object>(
 		"mergeRemote",
 		"mergeFromTab",
 		"replaceAll",
+		"prune",
 	]) {
 		Object.defineProperty(view, method, {
 			value: readOnlyError(collection.name, method),

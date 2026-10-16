@@ -1,4 +1,4 @@
-import type { HybridClock } from "../crdt/hlc.js";
+import type { HybridClock, Stamp } from "../crdt/hlc.js";
 import type { Entries, Entry } from "../crdt/lww-map.js";
 import type { Listener, Unsubscribe } from "../events/event-types.js";
 import type { ReactiveQuery } from "../reactivity/reactive-query.js";
@@ -95,6 +95,12 @@ export interface Collection<T extends object> {
 	 * Invalid values are reported and skipped (the stored copy, if any, stays).
 	 */
 	replaceAll(values: ReadonlyMap<string, unknown>): void;
+	/**
+	 * Remove keys the remote no longer has, whose entry here is older than `before` and
+	 * isn't pending: the remote dropped them as deletes old enough to forget (see the sync
+	 * engine). Returns the removed keys.
+	 */
+	prune(remote: Entries<T>, before: Stamp): string[];
 }
 
 export interface CreateCollectionOptions<T extends object> {

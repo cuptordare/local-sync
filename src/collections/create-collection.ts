@@ -495,5 +495,15 @@ export function createCollection<T extends object>(
 			notify(removed);
 		},
 		replaceAll,
+		prune(remote, before) {
+			assertActive();
+			const gone = [...entries].flatMap(([key, entry]) =>
+				!remote.has(key) && entry.stamp < before && !isPending(key, entry)
+					? [key]
+					: [],
+			);
+			removeKeys(gone);
+			return gone;
+		},
 	};
 }

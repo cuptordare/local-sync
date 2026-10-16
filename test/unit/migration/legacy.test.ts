@@ -215,7 +215,8 @@ describe("importing the old remote row", () => {
 	const oldRow = {
 		records: [
 			legacy("todo:shared", ["milk", "eggs"], 1_700_000_500_000),
-			legacy("todo:gone", null, 1_700_000_600_000),
+			legacy("todo:gone", null, Date.now() - 5 * 24 * 60 * 60 * 1000),
+			legacy("todo:long-gone", null, 1_700_000_600_000),
 		],
 	};
 
@@ -227,7 +228,8 @@ describe("importing the old remote row", () => {
 		assert.deepEqual(Object.fromEntries(newRow.values()), {
 			"todo:shared": { items: ["milk", "eggs"] },
 		});
-		assert.equal(newRow.entries["todo:gone"]?.deleted, true); // deletes carry over
+		assert.equal(newRow.entries["todo:gone"]?.deleted, true); // a recent delete carries over
+		assert.equal(newRow.entries["todo:long-gone"], undefined); // one over 30 days old is dropped
 		assert.deepEqual(d.todo.get("todo:shared"), { items: ["milk", "eggs"] });
 		assert.deepEqual(d.todo.collection.pending(), []);
 		const reads = d.oldRowReads();

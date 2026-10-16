@@ -14,6 +14,7 @@
  * `createEngine` is the scheduling core, shared with read-only sources (see app/source.ts).
  */
 import type { Collection } from "../collections/collection-types.js";
+import { stampAt } from "../crdt/hlc.js";
 import type { Entry } from "../crdt/lww-map.js";
 import { keysNewerIn, mergeEntries } from "../crdt/lww-map.js";
 import { createEventBus } from "../events/event-bus.js";
@@ -35,6 +36,8 @@ import { createSyncStatus } from "./sync-status.js";
 
 /** Compare-and-swap conflicts in a row before a push attempt counts as failed (and retries). */
 const MAX_WRITE_CONFLICTS = 5;
+/** How long a delete is kept on the remote (as a tombstone) before a push drops it. */
+export const DEFAULT_TOMBSTONE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 export interface CreateSyncEngineOptions<T extends object> {
 	collection: Collection<T>;
@@ -47,6 +50,13 @@ export interface CreateSyncEngineOptions<T extends object> {
 	sleep?: Sleep;
 	/** Injectable clock. */
 	now?: () => number;
+	/**
+	 * How long deletes are kept on the remote. A push drops older ones, and a device removes a
+	 * key the remote no longer has once its own copy is this old (and has no unsaved edit).
+	 * A device offline for longer, with an unsaved edit to a key deleted meanwhile, brings
+	 * that key back. Default 30 days.
+	 */
+	tombstoneTtlMs?: number;
 }
 
 export function createSyncEngine<T extends object>(
@@ -55,12 +65,18 @@ export function createSyncEngine<T extends object>(
 	const { collection, adapter } = options;
 	const retrying = <R>(fn: () => Promise<R>) =>
 		withRetry(fn, options.retry ?? {}, options.sleep);
+	const clock = options.now ?? defaultNow;
+	const ttl = options.tombstoneTtlMs ?? DEFAULT_TOMBSTONE_TTL_MS;
+	/** Deletes stamped before this are old enough to forget. */
+	const horizon = () => stampAt(Math.max(0, clock() - ttl));
 
 	const take = (remote: RemoteState<T>): void => {
 		if (remote.imported !== undefined && remote.imported.size > 0) {
 			collection.mergeRemote(remote.imported); // not on the remote yet: pending
 		}
 		collection.mergeRemote(remote.entries, { synced: true });
+		// A key the remote dropped (an old delete) goes here too.
+		collection.prune(remote.entries, horizon());
 	};
 
 	const write = adapter.write?.bind(adapter);
@@ -76,15 +92,25 @@ export function createSyncEngine<T extends object>(
 							const outgoing = keysNewerIn(local, remote.entries);
 							if (outgoing.length === 0) return; // the remote has everything
 							const merged = mergeEntries(remote.entries, local);
+							const cutoff = horizon();
+							for (const [key, entry] of merged) {
+								if (entry.deleted && entry.stamp < cutoff) merged.delete(key);
+							}
 							const result = await write(
 								merged,
 								remote.etag === undefined ? {} : { ifMatch: remote.etag },
 							);
 							if (result?.conflict !== true) {
 								const saved = new Map<string, Entry<T>>();
-								for (const key of outgoing)
-									saved.set(key, merged.get(key) as Entry<T>);
+								for (const key of outgoing) {
+									// (A dropped old delete counts as saved; the next read prunes it.)
+									saved.set(
+										key,
+										merged.get(key) ?? (local.get(key) as Entry<T>),
+									);
+								}
 								collection.mergeRemote(saved, { synced: true });
+								collection.prune(merged, cutoff); // the old deletes just dropped
 								return;
 							}
 							if (conflicts + 1 >= MAX_WRITE_CONFLICTS) {

@@ -357,8 +357,10 @@ logical clock**. Everything else follows from it.
 - **Whole values.** The latest write to a key replaces its value entirely; fields aren't
   merged. Keep keys small (see Recipe 2) where people edit at the same time.
 - **Deletes** are entries with `deleted: true` ("tombstones"), so other devices learn about them
-  and an older write can't bring the value back. They're kept indefinitely (about 90 characters
-  each in a blob).
+  and an older write can't bring the value back. They're kept for **30 days** (about 90
+  characters each), then a push drops them, and each device removes the key once its own copy
+  is that old too. So a device offline for over 30 days, with an unsaved edit to a key deleted
+  meanwhile, brings that key back. (`createSyncEngine`'s `tombstoneTtlMs` changes the 30 days.)
 - **Pull** reads the remote's entries and merges them in. **Push** reads, merges, and if this
   side has entries the remote lacks, writes the merge of both with `ifMatch`; on
   `{ conflict: true }` it reads, merges and tries again.
