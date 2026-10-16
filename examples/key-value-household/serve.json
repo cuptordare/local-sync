@@ -1,0 +1,9 @@
+{
+	"redirects": [
+		{
+			"source": "/",
+			"destination": "/examples/key-value-household/",
+			"type": 302
+		}
+	]
+}

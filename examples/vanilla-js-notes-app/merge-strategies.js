@@ -1,4 +1,4 @@
-import { custom } from "@localsync";
+import { custom } from "localsync";
 
 // A deterministic "combine both edits" strategy for the two-panel conflict demo.
 // Deterministic on purpose -- unlike lastWriteWins(), which depends on wall-clock

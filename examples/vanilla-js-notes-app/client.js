@@ -7,7 +7,7 @@ import {
 	preferDeletion,
 	serverWins,
 	ValidationError,
-} from "@localsync";
+} from "localsync";
 import { combineText } from "./merge-strategies.js";
 import { noteValidator } from "./note-validator.js";
 
@@ -70,19 +70,15 @@ export function createClient({
 		adapter: backend.forClient(label),
 		network,
 		keepPendingOnPull,
-		purgeDeletedOnPush: true, // compact acknowledged tombstones -- this app does real deletes/edits, unlike a mostly-append list
 		retry: { maxAttempts: 2 }, // shortened so the error banner (see "simulate server error") is reachable quickly
 	});
 
 	// Auto-sync ON by default: push shortly after every change AND poll for remote changes
 	// periodically -- this is what most real apps actually do, and a recipe example should
 	// default to it rather than requiring a developer to click buttons just to see basic
-	// sync happen. `pushOnChange` only coalesces mutations landing in the SAME microtask
-	// (see create-sync-engine.ts's schedulePush), but that's fine here: every mutation in
-	// this app is a discrete click (Add/Save/Delete), never a per-keystroke write, so
-	// there's no rapid-fire burst that needs a manual debounce on top. (If you added
-	// live-as-you-type autosave, THAT would need its own debounce, since pushOnChange
-	// doesn't coalesce across real event-loop ticks.)
+	// sync happen. `pushOnChange` is debounced (500ms by default; tune it with
+	// `pushOnChange: { debounceMs }`), so even live-as-you-type autosave becomes one push
+	// per pause rather than one per keystroke.
 	const AUTO_SYNC_INTERVAL_MS = 4000;
 	function startAutoSync() {
 		engine.start({
@@ -339,16 +335,15 @@ export function createClient({
 	});
 
 	// --- Structured status / error UI ---
-	// Failure here is `lastError !== undefined`, NOT `phase === "error"` -- the engine
-	// never sets that phase value; it always returns to "idle" and records lastError instead.
+	// `phase` is "syncing" while a pull/push runs, "error" after one fails (with the reason
+	// in `lastError`), and back to "idle" after the next success.
 	engine.on("sync:start", ({ direction }) => {
 		statusPhase.textContent = `syncing (${direction})…`;
 	});
 	engine.status.subscribe((state) => {
-		if (state.phase === "idle") {
-			statusPhase.textContent = state.lastError
-				? "idle (last attempt failed)"
-				: "idle";
+		if (state.phase !== "syncing") {
+			statusPhase.textContent =
+				state.phase === "error" ? "error (last attempt failed)" : "idle";
 		}
 		pendingBadge.textContent = `${state.pending} pending`;
 		if (state.lastError !== undefined) {

@@ -1,7 +1,7 @@
 // ============================================================================
 // localsync — vanilla JS notes app (the "recipe")
 // ----------------------------------------------------------------------------
-// This file uses ONLY @localsync -- no framework, no JSX, no build step. Two
+// This file uses ONLY localsync -- no framework, no JSX, no build step. Two
 // independent client "panels" (see client.js) both sync against ONE shared
 // mock backend (mock-backend.js), which is what lets this example demonstrate
 // real multi-user conflicts, persistence, validation, and error handling --
