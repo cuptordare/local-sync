@@ -273,3 +273,76 @@ describe("importing the old remote row", () => {
 		await Promise.all([d1.app.close(), d2.app.close()]);
 	});
 });
+
+/**
+ * A port of the Apps Script's getItem/setItem (google-app-scripts/*-project.gs): one row per
+ * id holding JSON, an etag column bumped on every write, `ifMatch` checked under a lock, and
+ * `{ records: [], etag: "0" }` for a row that doesn't exist yet.
+ */
+function createAppsScriptSheet() {
+	const rows = new Map<string, { json: string; etag: number }>();
+	return {
+		rows,
+		get(id: string): unknown {
+			const row = rows.get(id);
+			if (row === undefined) return { records: [], etag: "0" };
+			const value = JSON.parse(row.json);
+			return Array.isArray(value)
+				? { records: value, etag: String(row.etag) }
+				: { ...value, etag: String(row.etag) };
+		},
+		set(id: string, obj: Record<string, unknown>, ifMatch?: string) {
+			const row = rows.get(id);
+			const current = String(row?.etag ?? 0);
+			if (ifMatch !== undefined && ifMatch !== current)
+				return { conflict: true };
+			const { etag: _etag, ...value } = obj;
+			rows.set(id, { json: JSON.stringify(value), etag: (row?.etag ?? 0) + 1 });
+			return { updated: true };
+		},
+	};
+}
+
+describe("migrating through the real Apps Script behavior", () => {
+	it("two devices migrate the old row into the missing new row, leaving the old row as it was", async () => {
+		const sheet = createAppsScriptSheet();
+		const oldKey = "familyPantry:v2:todo:records";
+		const newKey = "familyPantry:v2:todo:lww";
+		sheet.set(oldKey, {
+			records: [legacy("todo:shared", ["milk"], 1_700_000_500_000)],
+		});
+		const oldRow = sheet.rows.get(oldKey)?.json;
+		const device = () => {
+			const app = createLocalSyncApp({
+				storage: createMemoryAdapter(),
+				network: createFakeNetworkStatus(true),
+				onError: () => {},
+			});
+			const todo = app.keyValue<Todo>("todo", {
+				remote: createBlobSyncAdapter<Todo>({
+					read: async () => sheet.get(newKey) as never,
+					write: async (blob, { ifMatch }) =>
+						sheet.set(newKey, blob as never, ifMatch).conflict === true
+							? { conflict: true }
+							: undefined,
+					legacy: { read: async () => sheet.get(oldKey) },
+				}),
+				autoSync: false,
+			});
+			return { app, todo };
+		};
+		const d1 = device();
+		const d2 = device();
+		await Promise.all([d1.app.ready(), d2.app.ready()]);
+		await Promise.all([d1.app.sync(), d2.app.sync()]);
+		d2.todo.set("todo:shared", { items: ["milk", "eggs"] });
+		await d2.app.sync();
+		await d1.app.sync();
+		assert.deepEqual(d1.todo.get("todo:shared"), { items: ["milk", "eggs"] });
+		const stored = JSON.parse(sheet.rows.get(newKey)?.json ?? "{}");
+		assert.equal(stored.format, "lww-1");
+		assert.equal(stored.etag, undefined); // the etag stays in its own column
+		assert.equal(sheet.rows.get(oldKey)?.json, oldRow); // untouched
+		await Promise.all([d1.app.close(), d2.app.close()]);
+	});
+});

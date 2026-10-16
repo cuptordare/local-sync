@@ -62,9 +62,16 @@ describe("createBlobSyncAdapter: read", () => {
 		);
 		// The old format: an old app version still reads (and writes) it.
 		await assert.rejects(
-			() => reading({ records: [] }).read(),
+			() => reading({ records: [{ id: "a", meta: {} }] }).read(),
 			/old \{ records \} format/,
 		);
+	});
+
+	it("reads an empty old-format document as empty (what the Apps Script returns for a missing row)", async () => {
+		assert.deepEqual(await reading({ records: [], etag: "0" }).read(), {
+			entries: new Map(),
+			etag: "0",
+		});
 	});
 });
 

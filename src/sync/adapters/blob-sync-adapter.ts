@@ -92,6 +92,16 @@ function parse<T>(raw: BlobSnapshot<T> | null | undefined): {
 	const withEtag = <R extends object>(result: R) =>
 		etag === undefined ? result : { ...result, etag };
 	if (raw.format === undefined && "records" in raw) {
+		// An empty old-format document (some backends answer that for a missing one) holds
+		// nothing to protect: it reads as empty.
+		const records = (raw as { records?: unknown }).records;
+		if (
+			Array.isArray(records) &&
+			records.length === 0 &&
+			raw.entries === undefined
+		) {
+			return withEtag({ entries: new Map() });
+		}
 		throw new Error(
 			"Blob read returned a document in the old { records } format. Save the new format " +
 				"under a new name, and pass the old one's reader as `legacy` to import it.",
