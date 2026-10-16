@@ -1,4 +1,4 @@
-import { invalid, valid } from "@localsync";
+import { invalid, valid } from "localsync";
 
 export const MAX_NOTE_LENGTH = 500;
 

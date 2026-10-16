@@ -7,7 +7,7 @@
     <script type="importmap">
       {
         "imports": {
-          "@localsync": "../../../dist/index.js"
+          "localsync": "../../../dist/index.js"
         }
       }
     </script>
@@ -15,7 +15,7 @@
 
 <body>
     <!--
-      A minimal page (no UI) that exposes @localsync's browser-dependent primitives on
+      A minimal page (no UI) that exposes localsync's browser-dependent primitives on
       `window.__ls` for Playwright's page.evaluate() to drive directly. Kept separate from
       examples/vanilla-js-notes-app so IndexedDB/multi-tab tests get isolated, test-controlled
       inputs instead of piggybacking on that example's mock-server delays and default storage.

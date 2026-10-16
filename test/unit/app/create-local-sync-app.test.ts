@@ -1,10 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createLocalSyncApp } from "../../../src/app/create-local-sync-app.js";
-import type {
-	StorageAdapter,
-	StoredRecord,
-} from "../../../src/storage/storage-adapter.js";
+import { createMemoryAdapter } from "../../../src/storage/memory-adapter.js";
+import type { StorageAdapter } from "../../../src/storage/storage-adapter.js";
 
 const wait = (ms = 10) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -46,16 +44,11 @@ describe("createLocalSyncApp: ready()", () => {
 			resolveHydration = resolve;
 		});
 		const slowAdapter: StorageAdapter = {
-			read: async () => undefined,
+			...createMemoryAdapter(),
 			readAll: async () => {
 				await gate;
-				return [] as StoredRecord[];
+				return new Map();
 			},
-			write: async () => {},
-			writeMany: async () => {},
-			remove: async () => {},
-			clear: async () => {},
-			close: async () => {},
 		};
 		const app = createLocalSyncApp({ storage: slowAdapter });
 		app.collection("notes");
@@ -70,6 +63,27 @@ describe("createLocalSyncApp: ready()", () => {
 		resolveHydration();
 		await readyPromise;
 		assert.equal(ready, true);
+	});
+
+	it("retries a load that failed", async () => {
+		const inner = createMemoryAdapter();
+		let failures = 1;
+		const app = createLocalSyncApp({
+			storage: {
+				...inner,
+				readAll: async (collection) => {
+					if (collection === "notes" && failures-- > 0)
+						throw new Error("disk unavailable");
+					return inner.readAll(collection);
+				},
+			},
+			onError: () => {},
+		});
+		const notes = app.collection<{ text: string }>("notes");
+		await assert.rejects(() => app.ready(), /disk unavailable/);
+		await app.ready();
+		assert.equal(notes.hydrated, true);
+		notes.upsert("k", { text: "works" });
 	});
 
 	it("resolves immediately when there are no collections", async () => {

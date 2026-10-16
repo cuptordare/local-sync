@@ -13,12 +13,18 @@ import { deepEqual } from "../utils/deep-equal.js";
 export type SyncPhase = "idle" | "syncing" | "error";
 
 export interface SyncState {
-	/** What the engine is doing right now. */
+	/**
+	 * What the engine is doing right now. `"error"` means a pull/push failed (see `lastError`)
+	 * and nothing has succeeded since -- it stays `"error"` during retries and returns to
+	 * `"idle"` after the next success.
+	 */
 	phase: SyncPhase;
 	/** Whether we believe we have connectivity. */
 	online: boolean;
 	/** Number of local changes waiting to be pushed. */
 	pending: number;
+	/** A debounced automatic push is scheduled (changes are about to be saved). */
+	pushScheduled: boolean;
 	/** Epoch ms of the last successful sync, if any. */
 	lastSyncedAt: number | undefined;
 	/** Wall-clock duration of the last successful sync, if any. */
@@ -41,6 +47,7 @@ export function createSyncStatus(initial: Partial<SyncState> = {}): SyncStatus {
 			phase: "idle",
 			online: true,
 			pending: 0,
+			pushScheduled: false,
 			lastSyncedAt: undefined,
 			lastSyncDurationMs: undefined,
 			lastError: undefined,

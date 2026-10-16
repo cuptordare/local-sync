@@ -1,73 +1,79 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { createEnvelope } from "../../../src/records/record-envelope.js";
+import type { Entry } from "../../../src/crdt/lww-map.js";
 import { createMemoryAdapter } from "../../../src/storage/memory-adapter.js";
+import type { StoredEntry } from "../../../src/storage/storage-adapter.js";
+
+const entry = (value: unknown, stamp: number, device = "d"): Entry => ({
+	value,
+	deleted: false,
+	stamp,
+	device,
+});
+const one = (key: string, stored: StoredEntry) => new Map([[key, stored]]);
 
 describe("createMemoryAdapter", () => {
-	it("write/read round-trips a record", async () => {
-		const adapter = createMemoryAdapter();
-		const record = createEnvelope({ n: 1 }, { id: "a" });
-		await adapter.write("notes", record);
-		const read = await adapter.read("notes", "a");
-		assert.deepEqual(read, record);
-	});
-
-	it("read() returns undefined for a missing record", async () => {
-		const adapter = createMemoryAdapter();
-		assert.equal(await adapter.read("notes", "missing"), undefined);
-	});
-
-	it("collections are isolated from each other", async () => {
-		const adapter = createMemoryAdapter();
-		await adapter.write("a", createEnvelope({ n: 1 }, { id: "x" }));
-		await adapter.write("b", createEnvelope({ n: 2 }, { id: "x" }));
-		assert.equal((await adapter.readAll("a")).length, 1);
-		assert.equal((await adapter.readAll("b")).length, 1);
-		assert.notDeepEqual(
-			await adapter.read("a", "x"),
-			await adapter.read("b", "x"),
+	it("merge then readAll round-trips entries and synced marks", async () => {
+		const storage = createMemoryAdapter();
+		await storage.merge(
+			"notes",
+			one("a", { entry: entry("x", 5), synced: { stamp: 5, device: "d" } }),
+		);
+		assert.deepEqual(
+			await storage.readAll("notes"),
+			one("a", { entry: entry("x", 5), synced: { stamp: 5, device: "d" } }),
 		);
 	});
 
-	it("writeMany() writes all given records", async () => {
-		const adapter = createMemoryAdapter();
-		await adapter.writeMany("notes", [
-			createEnvelope({ n: 1 }, { id: "a" }),
-			createEnvelope({ n: 2 }, { id: "b" }),
-		]);
-		assert.equal((await adapter.readAll("notes")).length, 2);
+	it("keeps the newer entry: an older write can never replace a newer one", async () => {
+		const storage = createMemoryAdapter();
+		await storage.merge("notes", one("a", { entry: entry("new", 9) }));
+		const result = await storage.merge(
+			"notes",
+			one("a", { entry: entry("old", 3) }),
+		);
+		assert.equal(result.get("a")?.entry.value, "new");
+		assert.equal((await storage.readAll("notes")).get("a")?.entry.value, "new");
 	});
 
-	it("remove() deletes a record", async () => {
-		const adapter = createMemoryAdapter();
-		await adapter.write("notes", createEnvelope({ n: 1 }, { id: "a" }));
-		await adapter.remove("notes", "a");
-		assert.equal(await adapter.read("notes", "a"), undefined);
+	it("merges entries and synced marks independently, each to the later one", async () => {
+		const storage = createMemoryAdapter();
+		await storage.merge(
+			"notes",
+			one("a", { entry: entry("edit", 9), synced: { stamp: 3, device: "d" } }),
+		);
+		// Another tab learned the remote holds write 7 (but still had the older value).
+		await storage.merge(
+			"notes",
+			one("a", {
+				entry: entry("synced", 7),
+				synced: { stamp: 7, device: "d" },
+			}),
+		);
+		assert.deepEqual((await storage.readAll("notes")).get("a"), {
+			entry: entry("edit", 9),
+			synced: { stamp: 7, device: "d" },
+		});
 	});
 
-	it("clear() removes an entire collection", async () => {
-		const adapter = createMemoryAdapter();
-		await adapter.writeMany("notes", [
-			createEnvelope({ n: 1 }, { id: "a" }),
-			createEnvelope({ n: 2 }, { id: "b" }),
-		]);
-		await adapter.clear("notes");
-		assert.deepEqual(await adapter.readAll("notes"), []);
+	it("keeps collections apart, and remove() deletes keys outright", async () => {
+		const storage = createMemoryAdapter();
+		await storage.merge("a", one("k", { entry: entry(1, 1) }));
+		await storage.merge("b", one("k", { entry: entry(2, 1) }));
+		await storage.remove("a", ["k"]);
+		assert.equal((await storage.readAll("a")).size, 0);
+		assert.equal((await storage.readAll("b")).get("k")?.entry.value, 2);
 	});
 
-	it("uses structuredClone isolation -- mutating a returned record doesn't affect internal state", async () => {
-		const adapter = createMemoryAdapter();
-		await adapter.write("notes", createEnvelope({ n: 1 }, { id: "a" }));
-		const read = (await adapter.read("notes", "a")) as { data: { n: number } };
-		read.data.n = 999;
-		const readAgain = (await adapter.read("notes", "a")) as {
-			data: { n: number };
-		};
-		assert.equal(readAgain.data.n, 1);
-	});
-
-	it("close() resolves without throwing", async () => {
-		const adapter = createMemoryAdapter();
-		await assert.doesNotReject(() => adapter.close());
+	it("hands out copies, so mutating a result doesn't change what's stored", async () => {
+		const storage = createMemoryAdapter();
+		const value = { text: "hi" };
+		await storage.merge("notes", one("a", { entry: entry(value, 1) }));
+		value.text = "changed by caller";
+		const read = await storage.readAll("notes");
+		(read.get("a")?.entry.value as { text: string }).text = "changed by reader";
+		assert.deepEqual((await storage.readAll("notes")).get("a")?.entry.value, {
+			text: "hi",
+		});
 	});
 });

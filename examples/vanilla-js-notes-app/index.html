@@ -380,11 +380,11 @@
     </style>
 
     <!-- The ONLY wiring needed: map the bare specifier to the built core ESM. -->
-    <!-- No bundler. The browser loads @localsync straight from dist. -->
+    <!-- No bundler. The browser loads localsync straight from dist. -->
     <script type="importmap">
       {
         "imports": {
-          "@localsync": "../../dist/index.js"
+          "localsync": "../../dist/index.js"
         }
       }
     </script>
@@ -395,28 +395,13 @@
         <h1>Notes — a local-first recipe</h1>
         <p>
             Two independent client panels below share one simulated backend, so you can see
-            real multi-user sync: persistence, offline queueing, validation, conflicting
-            edits, and error/retry handling.
+            real multi-user sync: persistence, offline queueing, validation, concurrent
+            edits (merged; for the same text, the later edit wins on both clients), and
+            error/retry handling.
         </p>
     </header>
 
     <section class="scenario-controls">
-        <label>Merge strategy
-            <select id="merge-select">
-                <option value="custom">custom — combine both edits (default)</option>
-                <option value="lastWriteWins">lastWriteWins</option>
-                <option value="serverWins">serverWins</option>
-            </select>
-        </label>
-        <label>Keep pending on pull
-            <select id="keep-pending-select">
-                <option value="true">true — default: your edit stays optimistic until pushed, safe
-                    for any merge strategy</option>
-                <option value="false">false — edge case: merge runs immediately on pull instead of
-                    waiting for your push (see README on why this needs a merge-strategy that's
-                    safe to invoke early)</option>
-            </select>
-        </label>
         <label><input type="checkbox" id="server-error-toggle" /> Simulate server errors</label>
     </section>
 
@@ -438,7 +423,7 @@
             <label><input type="checkbox" class="autosync-toggle" checked /> Auto-sync (push on
                 change + poll every 4s) — the default</label>
             <p class="manual-controls-hint">Manual controls below are for instrumenting edge
-                cases (e.g. the conflict walkthrough) — turn Auto-sync off first to use them
+                cases (e.g. editing one note on both clients) — turn Auto-sync off first to use them
                 deliberately.</p>
             <div class="row">
                 <button type="button" class="push-btn">Push</button>

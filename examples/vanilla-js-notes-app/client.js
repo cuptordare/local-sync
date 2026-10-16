@@ -3,46 +3,15 @@ import {
 	createLocalSyncApp,
 	createNetworkStatus,
 	createSyncEngine,
-	lastWriteWins,
-	preferDeletion,
-	serverWins,
 	ValidationError,
-} from "@localsync";
-import { combineText } from "./merge-strategies.js";
+} from "localsync";
 import { noteValidator } from "./note-validator.js";
-
-function resolveMerge(mergeMode) {
-	const base = (() => {
-		switch (mergeMode) {
-			case "lastWriteWins":
-				return lastWriteWins();
-			case "serverWins":
-				return serverWins();
-			default:
-				return combineText();
-		}
-	})();
-	// preferDeletion wraps WHATEVER strategy is selected above: a delete is just a dirty
-	// tombstone, so it goes through the same merge path as any other edit, and none of
-	// combineText()/serverWins() actually check `meta.deleted` (lastWriteWins mostly avoids
-	// this by luck, since a delete bumps the version). Without this wrapper, a pull that
-	// races ahead of a pending delete's push -- easy to hit now that auto-sync polls
-	// periodically -- can silently resurrect the deleted note, which then disappears again
-	// on the next pull once the delete actually lands. See src/records/record-merge.ts.
-	return preferDeletion(base);
-}
 
 // Builds one full client "panel": its own app/collection/storage/engine, plus all the
 // DOM wiring for one <section class="client"> mounted from the shared <template>. Two
 // of these, pointed at one shared mock backend, are what let this example demonstrate
 // multi-user editing without needing two real browser tabs.
-export function createClient({
-	label,
-	root,
-	backend,
-	mergeMode,
-	keepPendingOnPull,
-}) {
+export function createClient({ label, root, backend }) {
 	// Real persistence -- notes survive a reload, unlike the old in-memory-only example.
 	// Each client uses an EXPLICIT, distinct databaseName: if two createLocalSyncApp()
 	// instances both omitted it, they'd collide on IndexedDB's default "app"/v1 (see
@@ -53,10 +22,10 @@ export function createClient({
 		}),
 	});
 
-	const notes = app.collection("notes", {
-		validator: noteValidator,
-		merge: resolveMerge(mergeMode),
-	});
+	// Concurrent edits to one note are merged field by field; where both changed the same
+	// field (here, the text), the later edit wins, on every client (see the README's
+	// "Concurrent edits"). No merge code to write.
+	const notes = app.collection("notes", { validator: noteValidator });
 
 	// Each panel's online toggle is independent of the real browser network, so the demo
 	// isn't at the mercy of your actual wifi -- `watch` is overridden to a no-op source.
@@ -69,20 +38,15 @@ export function createClient({
 		collection: notes,
 		adapter: backend.forClient(label),
 		network,
-		keepPendingOnPull,
-		purgeDeletedOnPush: true, // compact acknowledged tombstones -- this app does real deletes/edits, unlike a mostly-append list
 		retry: { maxAttempts: 2 }, // shortened so the error banner (see "simulate server error") is reachable quickly
 	});
 
 	// Auto-sync ON by default: push shortly after every change AND poll for remote changes
 	// periodically -- this is what most real apps actually do, and a recipe example should
 	// default to it rather than requiring a developer to click buttons just to see basic
-	// sync happen. `pushOnChange` only coalesces mutations landing in the SAME microtask
-	// (see create-sync-engine.ts's schedulePush), but that's fine here: every mutation in
-	// this app is a discrete click (Add/Save/Delete), never a per-keystroke write, so
-	// there's no rapid-fire burst that needs a manual debounce on top. (If you added
-	// live-as-you-type autosave, THAT would need its own debounce, since pushOnChange
-	// doesn't coalesce across real event-loop ticks.)
+	// sync happen. `pushOnChange` is debounced (500ms by default; tune it with
+	// `pushOnChange: { debounceMs }`), so even live-as-you-type autosave becomes one push
+	// per pause rather than one per keystroke.
 	const AUTO_SYNC_INTERVAL_MS = 4000;
 	function startAutoSync() {
 		engine.start({
@@ -134,10 +98,10 @@ export function createClient({
 		const textLabel = document.createElement("span");
 		textLabel.className = "note-text";
 		textLabel.textContent = record.data.text;
-		if (record.meta.dirty) {
+		if (notes.pending().includes(record.id)) {
 			const tag = document.createElement("span");
 			tag.className = "unsynced";
-			tag.textContent = record.meta.deleted ? "unsynced delete" : "unsynced";
+			tag.textContent = "unsynced";
 			textLabel.appendChild(tag);
 		}
 		view.appendChild(textLabel);
@@ -190,9 +154,8 @@ export function createClient({
 	// The pending-synced-state pattern: while a note's edit form is open, incoming remote
 	// updates (e.g. the OTHER panel pushed a change to this same note) must NOT be applied
 	// straight into the textarea, or the user's in-progress typing gets silently yanked out
-	// from under them. `keepPendingOnPull` only protects a record once it's dirty (i.e.
-	// after the user's first committed edit) -- before that, while the form is merely open
-	// on an unmodified record, a pull would otherwise overwrite it. So instead of binding
+	// from under them. The draft isn't saved until Save, so the collection can't protect
+	// it -- a pull would show the newer value right away. So instead of binding
 	// the textarea to the live query, we subscribe separately, buffer the update, and only
 	// surface a hint -- the user's draft stays untouched until they explicitly Save or Cancel.
 	function openEditForm(li, record) {
@@ -202,9 +165,8 @@ export function createClient({
 		const hint = editForm.querySelector(".conflict-hint");
 		const errorEl = editForm.querySelector(".validation-error");
 
-		// Clone before treating this as a mutable scratch buffer -- Collection reads
-		// (peek/get/query) return live references into the store, not defensive copies.
-		textarea.value = structuredClone(record.data).text;
+		// Reads are frozen: copy the text into the textarea, which is the scratch buffer.
+		textarea.value = record.data.text;
 		hint.hidden = true;
 		errorEl.hidden = true;
 		editForm.hidden = false;
@@ -246,9 +208,8 @@ export function createClient({
 		const textarea = li.querySelector(".edit-textarea");
 		const errorEl = li.querySelector(".validation-error");
 		try {
-			// update() shallow-merges this patch onto the record's CURRENT data, so it
-			// naturally lands on top of whatever arrived while the form was open -- no
-			// manual merge needed here.
+			// The saved edit is stamped after everything this client has seen, so it wins
+			// over whatever arrived while the form was open (and is pushed as the latest).
 			notes.update(id, { text: textarea.value });
 			closeEditForm(id);
 		} catch (err) {
@@ -307,7 +268,7 @@ export function createClient({
 	});
 
 	// The one knob for pausing automation -- for deliberately orchestrating an edge case
-	// (the conflict walkthrough, the error/retry demo), not something a real app's user
+	// (the concurrent-edit walkthrough, the error/retry demo), not something a real app's user
 	// would normally see. engine.stop() halts both pushOnChange and interval polling;
 	// re-checking resumes them exactly as at startup.
 	autoSyncToggle.addEventListener("change", (event) => {
@@ -318,10 +279,8 @@ export function createClient({
 		}
 	});
 
-	// Push and Pull are exposed separately (not just the combined Sync) so the conflict
-	// walkthrough can push ONE side only, then pull the other -- forcing the still-dirty
-	// record through the configured merge strategy instead of blindly pushing over the
-	// server first (which the shared mock backend would just accept with no conflict check).
+	// Push and Pull are exposed separately (not just the combined Sync) so the walkthrough
+	// can push ONE side only, then pull the other, and watch how concurrent edits resolve.
 	pushBtn.addEventListener("click", () => void engine.push().catch(() => {}));
 	pullBtn.addEventListener("click", () => void engine.pull().catch(() => {}));
 	syncBtn.addEventListener("click", () => void engine.sync().catch(() => {}));
@@ -339,18 +298,19 @@ export function createClient({
 	});
 
 	// --- Structured status / error UI ---
-	// Failure here is `lastError !== undefined`, NOT `phase === "error"` -- the engine
-	// never sets that phase value; it always returns to "idle" and records lastError instead.
+	// `phase` is "syncing" while a pull/push runs, "error" after one fails (with the reason
+	// in `lastError`), and back to "idle" after the next success.
 	engine.on("sync:start", ({ direction }) => {
 		statusPhase.textContent = `syncing (${direction})…`;
 	});
 	engine.status.subscribe((state) => {
-		if (state.phase === "idle") {
-			statusPhase.textContent = state.lastError
-				? "idle (last attempt failed)"
-				: "idle";
+		if (state.phase !== "syncing") {
+			statusPhase.textContent =
+				state.phase === "error" ? "error (last attempt failed)" : "idle";
 		}
 		pendingBadge.textContent = `${state.pending} pending`;
+		// "unsynced" tags follow what's pending, which can change without any note changing.
+		if (unsubscribeList) render(activeNotes.getCurrentResult());
 		if (state.lastError !== undefined) {
 			errorBanner.hidden = false;
 			errorMessage.textContent = state.lastError;
@@ -383,13 +343,9 @@ export function createClient({
 		network.set(!network.isOnline()),
 	);
 
-	// Multi-tab coordination (createMultiTabSync) is intentionally NOT wired up here: it
-	// coordinates multiple TABS of the SAME user/device (e.g. gating engine.start() behind
-	// multiTab.isLeader() so only one tab talks to the network). Client A/B in this demo
-	// represent two DIFFERENT users/devices, so running real leader election between them
-	// would fight over one shared election for no reason. See the README's "Multi-tab
-	// support" section for the exact gating pattern to copy if you need it, and
-	// test/e2e/fixtures/multi-tab.spec.ts for a working example against a real harness.
+	// Multi-tab coordination is NOT used here: it keeps several TABS of one app on one
+	// device in step (createLocalSyncApp does it automatically when given a `name`). Client
+	// A/B in this demo represent two DIFFERENT devices, each with its own storage.
 
 	return { app, notes, engine, network };
 }

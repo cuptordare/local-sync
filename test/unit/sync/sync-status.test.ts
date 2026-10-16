@@ -9,6 +9,7 @@ describe("createSyncStatus", () => {
 			phase: "idle",
 			online: true,
 			pending: 0,
+			pushScheduled: false,
 			lastSyncedAt: undefined,
 			lastSyncDurationMs: undefined,
 			lastError: undefined,

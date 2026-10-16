@@ -1,15 +1,14 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createCollection } from "../../../src/collections/create-collection.js";
+import { createHybridClock } from "../../../src/crdt/hlc.js";
+import type { Entry } from "../../../src/crdt/lww-map.js";
 import { createMemoryAdapter } from "../../../src/storage/memory-adapter.js";
-import type {
-	StorageAdapter,
-	StoredRecord,
-} from "../../../src/storage/storage-adapter.js";
-import { createStorageEngine } from "../../../src/storage/storage-engine.js";
+import type { StorageAdapter } from "../../../src/storage/storage-adapter.js";
 
 interface Note {
 	text: string;
+	done?: boolean;
 }
 
 function makeCollection(
@@ -17,332 +16,374 @@ function makeCollection(
 ) {
 	return createCollection<Note>({
 		name: "notes",
-		storage: createStorageEngine(createMemoryAdapter()),
+		storage: createMemoryAdapter(),
+		writerId: async () => "me",
 		...overrides,
 	});
 }
 
+const entry = (
+	text: string | null,
+	stamp: number,
+	device = "other",
+): Entry<Note> => ({
+	value: text === null ? null : { text },
+	deleted: text === null,
+	stamp,
+	device,
+});
+
 const wait = (ms = 10) => new Promise((resolve) => setTimeout(resolve, ms));
 
 describe("create-collection: CRUD", () => {
-	it("insert() returns an id and applies synchronously", () => {
+	it("insert() returns an id and applies synchronously", async () => {
 		const notes = makeCollection();
-		const id = notes.insert({ text: "hi" });
+		await notes.ready;
+		const id = notes.insert({ text: "hello" });
 		assert.equal(typeof id, "string");
-		assert.equal(notes.peek(id)?.data.text, "hi");
+		assert.deepEqual(notes.peek(id)?.data, { text: "hello" });
 	});
 
-	it("insert() with an explicit id uses that id", () => {
+	it("insert() with an explicit id uses that id, and throws if a record is there", async () => {
 		const notes = makeCollection();
-		const id = notes.insert({ text: "hi" }, { id: "custom" });
-		assert.equal(id, "custom");
-	});
-
-	it("insert() throws if a record already exists at the given id (live)", () => {
-		const notes = makeCollection();
-		notes.insert({ text: "hi" }, { id: "dupe" });
+		await notes.ready;
+		assert.equal(notes.insert({ text: "a" }, { id: "x" }), "x");
 		assert.throws(
-			() => notes.insert({ text: "again" }, { id: "dupe" }),
+			() => notes.insert({ text: "b" }, { id: "x" }),
 			/already exists/,
 		);
-		// Original record must survive untouched.
-		assert.equal(notes.peek("dupe")?.data.text, "hi");
+		notes.delete("x");
+		notes.insert({ text: "c" }, { id: "x" }); // a deleted record can be inserted again
+		assert.equal(notes.peek("x")?.data.text, "c");
 	});
 
-	it("insert() throws if a record already exists at the given id (tombstoned)", () => {
+	it("update() shallow-merges; update() and replace() throw if the record is missing", async () => {
 		const notes = makeCollection();
-		notes.insert({ text: "hi" }, { id: "dupe" });
-		notes.delete("dupe");
-		assert.throws(
-			() => notes.insert({ text: "again" }, { id: "dupe" }),
-			/already exists/,
-		);
-	});
-
-	it("update() throws if the record is missing", () => {
-		const notes = makeCollection();
-		assert.throws(() => notes.update("missing", { text: "x" }), /missing/);
-	});
-
-	it("update() shallow-merges and bumps version", () => {
-		const notes = makeCollection();
-		const id = notes.insert({ text: "hi" });
-		notes.update(id, { text: "bye" });
-		assert.equal(notes.peek(id)?.data.text, "bye");
-		assert.equal(notes.peek(id)?.meta.version, 2);
-	});
-
-	it("replace() throws if the record is missing", () => {
-		const notes = makeCollection();
-		assert.throws(() => notes.replace("missing", { text: "x" }), /missing/);
-	});
-
-	it("replace() fully replaces the data", () => {
-		const notes = makeCollection();
-		const id = notes.insert({ text: "hi" });
-		notes.replace(id, { text: "replaced" });
-		assert.deepEqual(notes.peek(id)?.data, { text: "replaced" });
-	});
-
-	it("delete() no-ops on a missing record", () => {
-		const notes = makeCollection();
-		assert.doesNotThrow(() => notes.delete("missing"));
-	});
-
-	it("delete() no-ops on an already-deleted record (idempotent)", () => {
-		const notes = makeCollection();
-		const id = notes.insert({ text: "hi" });
+		await notes.ready;
+		const id = notes.insert({ text: "a" });
+		notes.update(id, { done: true });
+		assert.deepEqual(notes.peek(id)?.data, { text: "a", done: true });
+		notes.replace(id, { text: "b" });
+		assert.deepEqual(notes.peek(id)?.data, { text: "b" });
+		assert.throws(() => notes.update("nope", { text: "x" }), /missing record/);
+		assert.throws(() => notes.replace("nope", { text: "x" }), /missing record/);
 		notes.delete(id);
-		const versionAfterFirstDelete = notes.pending().find((r) => r.id === id)
-			?.meta.version;
-		notes.delete(id); // second delete should be a no-op, not bump version again
-		const versionAfterSecondDelete = notes.pending().find((r) => r.id === id)
-			?.meta.version;
-		assert.equal(versionAfterFirstDelete, versionAfterSecondDelete);
+		assert.throws(() => notes.update(id, { text: "x" }), /missing record/);
 	});
 
-	it("delete() tombstones a live record and bumps version", () => {
+	it("each write is a new entry stamped later than the last, by this tab", async () => {
 		const notes = makeCollection();
-		const id = notes.insert({ text: "hi" });
+		await notes.ready;
+		notes.upsert("k", { text: "one" });
+		const first = notes.peek("k")?.meta;
+		notes.upsert("k", { text: "two" });
+		const second = notes.peek("k")?.meta;
+		assert.ok(first && second && second.stamp > first.stamp);
+		assert.equal(second.device, "me");
+	});
+
+	it("delete() keeps a tombstone; it's a no-op on missing or deleted records", async () => {
+		const notes = makeCollection();
+		await notes.ready;
+		notes.delete("missing");
+		assert.equal(notes.snapshot().size, 0);
+		const id = notes.insert({ text: "a" });
 		notes.delete(id);
-		assert.equal(notes.peek(id), undefined); // tombstones are hidden from peek
+		const tombstone = notes.snapshot().get(id);
+		assert.equal(tombstone?.deleted, true);
+		assert.equal(tombstone?.value, null);
+		notes.delete(id);
+		assert.equal(notes.snapshot().get(id), tombstone);
 	});
 });
 
 describe("create-collection: reads", () => {
-	it("peek()/get()/query() hide tombstones", () => {
+	it("peek()/get()/query() hide deleted records", async () => {
 		const notes = makeCollection();
-		const id = notes.insert({ text: "hi" });
+		await notes.ready;
+		const id = notes.insert({ text: "a" });
 		notes.delete(id);
 		assert.equal(notes.peek(id), undefined);
 		assert.equal(notes.get(id).getCurrentResult(), undefined);
 		assert.deepEqual(notes.query().getCurrentResult(), []);
 	});
 
-	it("get(id) returns the same cached ReactiveQuery instance across calls", () => {
+	it("get(id) returns the same cached query, reactive to that record", async () => {
 		const notes = makeCollection();
-		const id = notes.insert({ text: "hi" });
-		assert.equal(notes.get(id), notes.get(id));
+		await notes.ready;
+		assert.equal(notes.get("a"), notes.get("a"));
+		const seen: Array<string | undefined> = [];
+		notes.get("a").subscribe((r) => seen.push(r?.data.text));
+		notes.upsert("a", { text: "one" });
+		notes.upsert("b", { text: "other" });
+		notes.upsert("a", { text: "two" });
+		assert.deepEqual(seen, ["one", "two"]);
 	});
 
-	it("get(id) is reactive to changes on that record", () => {
+	it("query(predicate) filters and stays live", async () => {
 		const notes = makeCollection();
-		const id = notes.insert({ text: "hi" });
-		const seen: (string | undefined)[] = [];
-		notes.get(id).subscribe((r) => seen.push(r?.data.text));
-		notes.update(id, { text: "bye" });
-		assert.deepEqual(seen, ["bye"]);
+		await notes.ready;
+		const long = notes.query((n) => n.text.length > 3);
+		const seen: string[][] = [];
+		long.subscribe((rows) => seen.push(rows.map((r) => r.data.text)));
+		notes.upsert("a", { text: "short" });
+		notes.upsert("b", { text: "no" });
+		notes.upsert("a", { text: "x" });
+		assert.deepEqual(seen, [["short"], []]);
 	});
 
-	it("query(predicate) filters by data and excludes tombstones", () => {
+	it("reports deletes as 'deleted' changes, and live values as 'set'", async () => {
 		const notes = makeCollection();
-		notes.insert({ text: "keep" });
-		const dropId = notes.insert({ text: "drop" });
-		notes.delete(dropId);
-		const kept = notes.query((data) => data.text === "keep").getCurrentResult();
-		assert.equal(kept.length, 1);
-		assert.equal(kept[0]?.data.text, "keep");
-	});
-
-	it("query() is reactive to store changes", () => {
-		const notes = makeCollection();
-		const query = notes.query();
-		const seen: number[] = [];
-		query.subscribe((rows) => seen.push(rows.length));
-		notes.insert({ text: "a" });
-		assert.deepEqual(seen, [1]);
+		await notes.ready;
+		const kinds: string[] = [];
+		notes.subscribe(({ changes }) => {
+			for (const c of changes)
+				kinds.push(`${c.kind}:${c.record?.data.text ?? ""}`);
+		});
+		notes.upsert("a", { text: "x" });
+		notes.delete("a");
+		assert.deepEqual(kinds, ["set:x", "deleted:"]);
 	});
 });
 
-describe("create-collection: write ordering", () => {
-	it("persists writes in version order even if the adapter resolves them out of order", async () => {
-		const calls: number[] = [];
-		const adapter: StorageAdapter = {
-			read: async () => undefined,
-			readAll: async () => [],
-			async write(_collection, record) {
-				// Artificial variable delay -- later calls resolve "faster" than earlier ones would
-				// if they were fired concurrently. Because create-collection serializes writes on a
-				// promise chain, this call won't even start until the previous one finished, so the
-				// recorded order must still match version order.
-				const delay =
-					30 -
-					(record as StoredRecord & { meta: { version: number } }).meta
-						.version *
-						5;
-				await wait(Math.max(delay, 1));
-				calls.push(
-					(record as StoredRecord & { meta: { version: number } }).meta.version,
-				);
+describe("create-collection: persistence", () => {
+	it("stores the latest value even when an earlier storage write is slow", async () => {
+		const inner = createMemoryAdapter();
+		let calls = 0;
+		const storage: StorageAdapter = {
+			...inner,
+			async merge(collection, changes) {
+				// The first write lands last.
+				await wait(++calls === 1 ? 30 : 1);
+				return inner.merge(collection, changes);
 			},
-			writeMany: async () => {},
-			remove: async () => {},
-			clear: async () => {},
-			close: async () => {},
 		};
-		const notes = createCollection<Note>({
-			name: "notes",
-			storage: createStorageEngine(adapter),
+		const notes = makeCollection({ storage });
+		await notes.ready;
+		notes.upsert("k", { text: "one" });
+		await Promise.resolve(); // separate storage writes
+		await wait(5);
+		notes.upsert("k", { text: "two" });
+		await wait(60);
+		await notes.whenPersisted();
+		const stored = await inner.readAll("notes");
+		assert.deepEqual(stored.get("k")?.entry.value, { text: "two" });
+	});
+
+	it("a burst of writes is one storage write", async () => {
+		const inner = createMemoryAdapter();
+		let merges = 0;
+		const notes = makeCollection({
+			storage: {
+				...inner,
+				merge: (c, changes) => {
+					merges++;
+					return inner.merge(c, changes);
+				},
+			},
 		});
-		const id = notes.insert({ text: "v1" });
-		notes.update(id, { text: "v2" });
-		notes.update(id, { text: "v3" });
-		await wait(100);
-		assert.deepEqual(calls, [1, 2, 3]);
+		await notes.ready;
+		notes.upsert("a", { text: "1" });
+		notes.upsert("b", { text: "2" });
+		notes.upsert("a", { text: "3" });
+		await notes.whenPersisted();
+		assert.equal(merges, 1);
+		assert.equal((await inner.readAll("notes")).size, 2);
+	});
+
+	it("loads stored entries, and stamps new writes after them", async () => {
+		const storage = createMemoryAdapter();
+		const future = Date.now() * 1000 + 10_000_000;
+		await storage.merge(
+			"notes",
+			new Map([["k", { entry: entry("stored", future) }]]),
+		);
+		const notes = makeCollection({ storage, clock: createHybridClock() });
+		await notes.ready;
+		assert.equal(notes.peek("k")?.data.text, "stored");
+		notes.upsert("k", { text: "mine" });
+		assert.ok((notes.peek("k")?.meta.stamp ?? 0) > future);
+	});
+
+	it("routes failed storage writes to onError, and writes them with the next change", async () => {
+		const inner = createMemoryAdapter();
+		let fail = true;
+		const errors: string[] = [];
+		const notes = makeCollection({
+			storage: {
+				...inner,
+				async merge(collection, changes) {
+					if (fail) throw new Error("disk full");
+					return inner.merge(collection, changes);
+				},
+			},
+			onError: (error, info) => errors.push(`${info.source}: ${String(error)}`),
+		});
+		await notes.ready;
+		notes.upsert("a", { text: "1" });
+		await notes.whenPersisted();
+		assert.deepEqual(errors, ["storage: Error: disk full"]);
+		fail = false;
+		notes.upsert("b", { text: "2" });
+		await notes.whenPersisted();
+		assert.deepEqual([...(await inner.readAll("notes")).keys()].sort(), [
+			"a",
+			"b",
+		]);
 	});
 });
 
 describe("create-collection: sync integration", () => {
-	it("pending() returns exactly the dirty records", () => {
+	it("pending() lists keys with writes the remote isn't known to hold", async () => {
 		const notes = makeCollection();
-		const cleanId = notes.insert({ text: "a" }, { now: 1 });
-		notes.markSynced([cleanId]);
-		const dirtyId = notes.insert({ text: "b" });
-		const pending = notes.pending();
-		assert.equal(pending.length, 1);
-		assert.equal(pending[0]?.id, dirtyId);
-	});
-
-	it("applyRemote: keepPending=true leaves a locally-dirty record untouched", () => {
-		const notes = makeCollection();
-		const id = notes.insert({ text: "local edit" });
-		notes.applyRemote(
-			[
-				{
-					id,
-					data: { text: "remote" },
-					meta: {
-						version: 99,
-						createdAt: 0,
-						updatedAt: 0,
-						deleted: false,
-						dirty: false,
-						source: "remote",
-					},
-				},
-			],
-			{ keepPending: true },
-		);
-		assert.equal(notes.peek(id)?.data.text, "local edit");
-	});
-
-	it("applyRemote: keepPending=false (default) resolves via the merge strategy", () => {
-		const notes = makeCollection();
-		const id = notes.insert({ text: "local edit" });
-		notes.applyRemote([
+		await notes.ready;
+		notes.upsert("a", { text: "1" });
+		notes.upsert("b", { text: "2" });
+		notes.delete("b");
+		assert.deepEqual(notes.pending().sort(), ["a", "b"]);
+		notes.mergeRemote(
+			new Map([["a", notes.snapshot().get("a") as Entry<Note>]]),
 			{
-				id,
-				data: { text: "remote" },
-				meta: {
-					version: 99,
-					createdAt: 0,
-					updatedAt: 0,
-					deleted: false,
-					dirty: false,
-					source: "remote",
-				},
+				synced: true,
 			},
-		]);
-		// default merge is serverWins -- remote wins
-		assert.equal(notes.peek(id)?.data.text, "remote");
-	});
-
-	it("applyRemote: clean/missing local records always take the remote value", () => {
-		const notes = makeCollection();
-		notes.applyRemote([
-			{
-				id: "new-from-remote",
-				data: { text: "remote" },
-				meta: {
-					version: 1,
-					createdAt: 0,
-					updatedAt: 0,
-					deleted: false,
-					dirty: false,
-					source: "remote",
-				},
-			},
-		]);
-		assert.equal(notes.peek("new-from-remote")?.data.text, "remote");
-	});
-
-	it("applyRemote: empty array is a no-op", () => {
-		const notes = makeCollection();
-		const before = notes.query().getCurrentResult();
-		notes.applyRemote([]);
-		assert.deepEqual(notes.query().getCurrentResult(), before);
-	});
-
-	it("markSynced clears dirty only for currently-dirty ids, no-ops otherwise", () => {
-		const notes = makeCollection();
-		const id = notes.insert({ text: "a" });
-		assert.equal(notes.peek(id)?.meta.dirty, true);
-		notes.markSynced([id, "missing-id"]);
-		assert.equal(notes.peek(id)?.meta.dirty, false);
-		assert.equal(notes.pending().length, 0);
-	});
-
-	it("purgeDeleted removes only synced tombstones (deleted && !dirty)", () => {
-		const notes = makeCollection();
-		const unsyncedDeleteId = notes.insert({ text: "a" });
-		notes.delete(unsyncedDeleteId); // dirty tombstone -- must be kept
-
-		const syncedDeleteId = notes.insert({ text: "b" }, { now: 1 });
-		notes.delete(syncedDeleteId);
-		notes.markSynced([syncedDeleteId]); // dirty=false tombstone -- purgeable
-
-		const purged = notes.purgeDeleted();
-		assert.deepEqual(purged, [syncedDeleteId]);
-
-		// purged record is gone from the store entirely (not just hidden)
-		assert.equal(
-			notes.pending().some((r) => r.id === syncedDeleteId),
-			false,
 		);
-		// unsynced tombstone survives
-		assert.equal(
-			notes.pending().some((r) => r.id === unsyncedDeleteId),
-			true,
-		);
+		assert.deepEqual(notes.pending(), ["b"]);
 	});
-});
 
-describe("create-collection: error handling", () => {
-	it("routes background persistence failures to onError", async () => {
-		const errors: unknown[] = [];
-		const failingAdapter: StorageAdapter = {
-			read: async () => undefined,
-			readAll: async () => [],
-			write: async () => {
-				throw new Error("disk full");
-			},
-			writeMany: async () => {},
-			remove: async () => {},
-			clear: async () => {},
-			close: async () => {},
-		};
-		const notes = createCollection<Note>({
-			name: "notes",
-			storage: createStorageEngine(failingAdapter),
-			onError: (err) => errors.push(err),
+	it("mergeRemote keeps the newer entry per key, whatever arrives when", async () => {
+		const notes = makeCollection();
+		await notes.ready;
+		notes.mergeRemote(new Map([["k", entry("newer", 20)]]), { synced: true });
+		notes.mergeRemote(new Map([["k", entry("older", 10)]]), { synced: true }); // a stale pull
+		assert.equal(notes.peek("k")?.data.text, "newer");
+		assert.deepEqual(notes.pending(), []);
+	});
+
+	it("a local write made after seeing remote data beats it, and stays pending", async () => {
+		const notes = makeCollection({ clock: createHybridClock(() => 1) }); // wall clock far behind
+		await notes.ready;
+		notes.mergeRemote(new Map([["k", entry("theirs", 5_000_000)]]), {
+			synced: true,
 		});
-		notes.insert({ text: "a" });
-		await wait(20);
-		assert.equal(errors.length, 1);
-		assert.equal((errors[0] as Error).message, "disk full");
+		notes.upsert("k", { text: "mine" });
+		notes.mergeRemote(new Map([["k", entry("theirs", 5_000_000)]]), {
+			synced: true,
+		});
+		assert.equal(notes.peek("k")?.data.text, "mine");
+		assert.deepEqual(notes.pending(), ["k"]);
+	});
+
+	it("merging the same thing again changes nothing (no notification, no storage write)", async () => {
+		const inner = createMemoryAdapter();
+		let merges = 0;
+		const notes = makeCollection({
+			storage: {
+				...inner,
+				merge: (c, changes) => {
+					merges++;
+					return inner.merge(c, changes);
+				},
+			},
+		});
+		await notes.ready;
+		const remote = new Map([["k", entry("x", 7)]]);
+		notes.mergeRemote(remote, { synced: true });
+		await notes.whenPersisted();
+		let notified = 0;
+		notes.subscribe(() => notified++);
+		notes.mergeRemote(remote, { synced: true });
+		await notes.whenPersisted();
+		assert.equal(notified, 0);
+		assert.equal(merges, 1);
+	});
+
+	it("mergeFromTab takes in another tab's stored entries without writing them again", async () => {
+		const inner = createMemoryAdapter();
+		let merges = 0;
+		const notes = makeCollection({
+			storage: {
+				...inner,
+				merge: (c, changes) => {
+					merges++;
+					return inner.merge(c, changes);
+				},
+			},
+		});
+		await notes.ready;
+		notes.mergeFromTab(
+			new Map([
+				[
+					"k",
+					{
+						entry: entry("from tab", 9),
+						synced: { stamp: 9, device: "other" },
+					},
+				],
+			]),
+			[],
+		);
+		await notes.whenPersisted();
+		assert.equal(notes.peek("k")?.data.text, "from tab");
+		assert.deepEqual(notes.pending(), []);
+		assert.equal(merges, 0);
+	});
+
+	it("tab messages arriving before loading finishes are kept", async () => {
+		const inner = createMemoryAdapter();
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const notes = makeCollection({
+			storage: {
+				...inner,
+				async readAll(c) {
+					await gate;
+					return inner.readAll(c);
+				},
+			},
+		});
+		notes.mergeFromTab(new Map([["k", { entry: entry("early", 9) }]]), []);
+		release();
+		await notes.ready;
+		assert.equal(notes.peek("k")?.data.text, "early");
+	});
+
+	it("a merge is ordered right after its later edit, so a newer edit from another tab still wins", async () => {
+		const notes = makeCollection({ writerId: async () => "dev.t1" });
+		await notes.ready;
+		const base = entry("a", 100);
+		notes.mergeRemote(new Map([["k", base]]), { synced: true });
+		// Tab t2 (same device) edits; this tab is the one that syncs.
+		const edit: Entry<Note> = {
+			value: { text: "a", done: true },
+			deleted: false,
+			stamp: 200,
+			device: "dev.t2",
+		};
+		notes.mergeFromTab(new Map([["k", { entry: edit, base }]]), []);
+		// Someone else saved a change meanwhile: merged with t2's edit.
+		notes.mergeRemote(new Map([["k", entry("b", 150)]]), { synced: true });
+		assert.deepEqual(notes.peek("k")?.data, { text: "b", done: true });
+		assert.equal(notes.peek("k")?.meta.stamp, 200);
+		assert.equal(notes.peek("k")?.meta.device, "dev.t2~dev.t1");
+		// t2 made another edit before hearing of the merge: it's later, so it wins.
+		notes.mergeFromTab(
+			new Map([
+				["k", { entry: { ...edit, value: { text: "a" }, stamp: 201 } }],
+			]),
+			[],
+		);
+		assert.deepEqual(notes.peek("k")?.data, { text: "a" });
 	});
 });
 
 describe("create-collection: dispose", () => {
-	it("mutating calls throw after dispose()", () => {
+	it("mutating calls throw after dispose(), which is idempotent", async () => {
 		const notes = makeCollection();
+		await notes.ready;
 		notes.dispose();
-		assert.throws(() => notes.insert({ text: "a" }), /disposed/);
-	});
-
-	it("dispose() is idempotent", () => {
-		const notes = makeCollection();
 		notes.dispose();
-		assert.doesNotThrow(() => notes.dispose());
+		assert.throws(() => notes.insert({ text: "x" }), /disposed/);
 	});
 });

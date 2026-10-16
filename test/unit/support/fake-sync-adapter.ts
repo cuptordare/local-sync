@@ -1,9 +1,9 @@
+import type { Entries } from "../../../src/crdt/lww-map.js";
 import type {
-	Mutation,
-	PullArgs,
-	PullResult,
-	PushResult,
+	RemoteState,
 	SyncAdapter,
+	WriteOptions,
+	WriteResult,
 } from "../../../src/sync/sync-adapter.js";
 
 export interface Deferred<T> {
@@ -23,67 +23,45 @@ export function createDeferred<T>(): Deferred<T> {
 }
 
 /**
- * A SyncAdapter whose pull/push are controlled externally via deferred promises,
- * so tests can simulate in-flight races (e.g. a push that's still pending while
- * the collection changes underneath it).
+ * A SyncAdapter whose read/write are controlled externally via deferred promises, so tests
+ * can hold a request in flight while things change underneath it.
  */
 export interface FakeSyncAdapter<T> extends SyncAdapter<T> {
-	pullCalls: number;
-	pushCalls: number;
-	pushMutationsHistory: Mutation<T>[][];
-	pullArgsHistory: PullArgs<unknown, unknown>[];
-	/** Resolve the next pending pull() call. */
-	resolvePull(result: PullResult<T, unknown>): void;
-	rejectPull(error: unknown): void;
-	/** Resolve the next pending push() call. */
-	resolvePush(result: PushResult<T>): void;
-	rejectPush(error: unknown): void;
+	readCalls: number;
+	writes: Array<{ entries: Entries<T>; options: WriteOptions }>;
+	/** Resolve the pending read() call. */
+	resolveRead(state: RemoteState<T>): void;
+	rejectRead(error: unknown): void;
+	/** Resolve the pending write() call. */
+	resolveWrite(result?: WriteResult): void;
+	rejectWrite(error: unknown): void;
 }
 
 export function createFakeSyncAdapter<T>(
 	options: { readOnly?: boolean } = {},
 ): FakeSyncAdapter<T> {
-	let pullDeferred: Deferred<PullResult<T, unknown>> | undefined;
-	let pushDeferred: Deferred<PushResult<T>> | undefined;
+	let readDeferred: Deferred<RemoteState<T>> | undefined;
+	let writeDeferred: Deferred<WriteResult> | undefined;
 
 	const adapter: FakeSyncAdapter<T> = {
-		pullCalls: 0,
-		pushCalls: 0,
-		pushMutationsHistory: [],
-		pullArgsHistory: [],
-
-		pull(args) {
-			adapter.pullCalls += 1;
-			adapter.pullArgsHistory.push(args);
-			pullDeferred = createDeferred<PullResult<T, unknown>>();
-			return pullDeferred.promise;
+		readCalls: 0,
+		writes: [],
+		read() {
+			adapter.readCalls += 1;
+			readDeferred = createDeferred();
+			return readDeferred.promise;
 		},
-
-		resolvePull(result) {
-			pullDeferred?.resolve(result);
-		},
-
-		rejectPull(error) {
-			pullDeferred?.reject(error);
-		},
-
-		resolvePush(result) {
-			pushDeferred?.resolve(result);
-		},
-
-		rejectPush(error) {
-			pushDeferred?.reject(error);
-		},
+		resolveRead: (state) => readDeferred?.resolve(state),
+		rejectRead: (error) => readDeferred?.reject(error),
+		resolveWrite: (result) => writeDeferred?.resolve(result),
+		rejectWrite: (error) => writeDeferred?.reject(error),
 	};
-
 	if (!options.readOnly) {
-		adapter.push = (mutations: Mutation<T>[]) => {
-			adapter.pushCalls += 1;
-			adapter.pushMutationsHistory.push(mutations);
-			pushDeferred = createDeferred<PushResult<T>>();
-			return pushDeferred.promise;
+		adapter.write = (entries, writeOptions) => {
+			adapter.writes.push({ entries, options: writeOptions });
+			writeDeferred = createDeferred();
+			return writeDeferred.promise;
 		};
 	}
-
 	return adapter;
 }

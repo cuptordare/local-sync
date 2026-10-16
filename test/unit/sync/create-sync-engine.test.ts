@@ -1,564 +1,708 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createCollection } from "../../../src/collections/create-collection.js";
+import { stampAt } from "../../../src/crdt/hlc.js";
+import type { Entry } from "../../../src/crdt/lww-map.js";
 import { createMemoryAdapter } from "../../../src/storage/memory-adapter.js";
-import { createStorageEngine } from "../../../src/storage/storage-engine.js";
+import type { StorageAdapter } from "../../../src/storage/storage-adapter.js";
+import { createBlobSyncAdapter } from "../../../src/sync/adapters/blob-sync-adapter.js";
 import { createSyncEngine } from "../../../src/sync/create-sync-engine.js";
 import type { SyncAdapter } from "../../../src/sync/sync-adapter.js";
+import { createFakeBlobServer } from "../support/fake-blob-server.js";
 import { createInstantSleep } from "../support/fake-clock.js";
 import { createFakeNetworkStatus } from "../support/fake-network-status.js";
-import { createFakeSyncAdapter } from "../support/fake-sync-adapter.js";
+import {
+	createDeferred,
+	createFakeSyncAdapter,
+} from "../support/fake-sync-adapter.js";
 
-interface Note {
+interface Item {
 	n: number;
 }
 
 const wait = (ms = 10) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function makeCollection() {
-	return createCollection<Note>({
-		name: "notes",
-		storage: createStorageEngine(createMemoryAdapter()),
+async function makeCollection(storage: StorageAdapter = createMemoryAdapter()) {
+	const collection = createCollection<Item>({
+		name: "items",
+		storage,
+		writerId: async () => "me",
 	});
+	await collection.ready;
+	return collection;
 }
 
-describe("create-sync-engine: pull", () => {
-	it("applies pulled records into the collection", async () => {
-		const collection = makeCollection();
-		const adapter = createFakeSyncAdapter<Note>({ readOnly: true });
-		const engine = createSyncEngine({
-			collection,
-			adapter,
-			sleep: createInstantSleep(),
-		});
-
-		const pullPromise = engine.pull();
-		adapter.resolvePull({
-			records: [
-				{
-					id: "remote-1",
-					data: { n: 1 },
-					meta: {
-						version: 1,
-						createdAt: 0,
-						updatedAt: 0,
-						deleted: false,
-						dirty: false,
-						source: "remote",
-					},
-				},
-			],
-		});
-		await pullPromise;
-		assert.equal(collection.peek("remote-1")?.data.n, 1);
-	});
-
-	it("keepPendingOnPull=true (default) preserves a locally-dirty record", async () => {
-		const collection = makeCollection();
-		const id = collection.insert({ n: 1 });
-		const adapter = createFakeSyncAdapter<Note>({ readOnly: true });
-		const engine = createSyncEngine({
-			collection,
-			adapter,
-			sleep: createInstantSleep(),
-		});
-
-		const pullPromise = engine.pull();
-		adapter.resolvePull({
-			records: [
-				{
-					id,
-					data: { n: 999 },
-					meta: {
-						version: 99,
-						createdAt: 0,
-						updatedAt: 0,
-						deleted: false,
-						dirty: false,
-						source: "remote",
-					},
-				},
-			],
-		});
-		await pullPromise;
-		assert.equal(collection.peek(id)?.data.n, 1); // local edit preserved
-	});
-
-	it("setFilter resets the cursor for the next pull", async () => {
-		const collection = makeCollection();
-		const adapter = createFakeSyncAdapter<Note>({ readOnly: true });
-		const engine = createSyncEngine({
-			collection,
-			adapter,
-			sleep: createInstantSleep(),
-		});
-
-		const p1 = engine.pull();
-		adapter.resolvePull({ records: [], cursor: "cursor-1" });
-		await p1;
-
-		const p2 = engine.pull();
-		adapter.resolvePull({ records: [] });
-		await p2;
-		assert.equal(adapter.pullArgsHistory[1]?.cursor, "cursor-1");
-
-		engine.setFilter("new-filter");
-		const p3 = engine.pull();
-		adapter.resolvePull({ records: [] });
-		await p3;
-		assert.equal(adapter.pullArgsHistory[2]?.cursor, undefined);
-		assert.equal(adapter.pullArgsHistory[2]?.filter, "new-filter");
-	});
+const entry = (
+	n: number | null,
+	stamp: number,
+	device = "other",
+): Entry<Item> => ({
+	value: n === null ? null : { n },
+	deleted: n === null,
+	stamp,
+	device,
 });
 
-describe("create-sync-engine: push", () => {
-	it("pushes pending records and marks them synced on ack", async () => {
-		const collection = makeCollection();
-		const id = collection.insert({ n: 1 });
-		const adapter = createFakeSyncAdapter<Note>();
-		const engine = createSyncEngine({
-			collection,
-			adapter,
-			sleep: createInstantSleep(),
-		});
-
-		const pushPromise = engine.push();
-		const mutationId = adapter.pushMutationsHistory[0]?.[0]
-			?.mutationId as string;
-		adapter.resolvePush({ acked: [mutationId] });
-		await pushPromise;
-
-		assert.equal(collection.peek(id)?.meta.dirty, false);
-		assert.equal(collection.pending().length, 0);
+/** A collection synced through a fake blob server (etags on). */
+async function setup(
+	options: { cas?: boolean; storage?: StorageAdapter } = {},
+) {
+	const server = createFakeBlobServer<Item>({ cas: options.cas ?? true });
+	const collection = await makeCollection(options.storage);
+	const engine = createSyncEngine({
+		collection,
+		adapter: createBlobSyncAdapter(server),
+		sleep: createInstantSleep(),
 	});
+	return { server, collection, engine };
+}
 
-	it("is a no-op when there is nothing pending", async () => {
-		const collection = makeCollection();
-		const adapter = createFakeSyncAdapter<Note>();
-		const engine = createSyncEngine({
-			collection,
-			adapter,
-			sleep: createInstantSleep(),
-		});
-		await engine.push();
-		assert.equal(adapter.pushCalls, 0);
-	});
+const values = (collection: Awaited<ReturnType<typeof makeCollection>>) =>
+	Object.fromEntries(
+		collection
+			.query()
+			.getCurrentResult()
+			.map((r) => [r.id, r.data.n]),
+	);
 
-	it("is a no-op for a read-only (pull-only) adapter", async () => {
-		const collection = makeCollection();
-		collection.insert({ n: 1 });
-		const adapter = createFakeSyncAdapter<Note>({ readOnly: true });
-		const engine = createSyncEngine({
-			collection,
-			adapter,
-			sleep: createInstantSleep(),
-		});
-		await engine.push();
-		assert.equal(adapter.pushCalls, 0);
-	});
-
-	it("dedupes concurrent push() calls into a single adapter call", async () => {
-		const collection = makeCollection();
-		collection.insert({ n: 1 });
-		const adapter = createFakeSyncAdapter<Note>();
-		const engine = createSyncEngine({
-			collection,
-			adapter,
-			sleep: createInstantSleep(),
-		});
-
-		const p1 = engine.push();
-		const p2 = engine.push(); // called while p1's adapter.push() is still pending
-		assert.equal(adapter.pushCalls, 1);
-
-		const mutationId = adapter.pushMutationsHistory[0]?.[0]
-			?.mutationId as string;
-		adapter.resolvePush({ acked: [mutationId] });
-		await Promise.all([p1, p2]);
-		assert.equal(adapter.pushCalls, 1); // no second push call, since nothing new became dirty
-	});
-
-	it("a call requested while running re-runs for records dirtied in the meantime", async () => {
-		const collection = makeCollection();
-		collection.insert({ n: 1 });
-		const adapter = createFakeSyncAdapter<Note>();
-		const engine = createSyncEngine({
-			collection,
-			adapter,
-			sleep: createInstantSleep(),
-		});
-
-		const p1 = engine.push();
-		collection.insert({ n: 2 }); // new dirty record while the first push is in flight
-		const p2 = engine.push();
-
-		const firstMutationId = adapter.pushMutationsHistory[0]?.[0]
-			?.mutationId as string;
-		adapter.resolvePush({ acked: [firstMutationId] });
-		await wait(20); // let the do-while loop notice the newly-dirty record and re-run
-
-		assert.equal(adapter.pushCalls, 2);
-		const secondMutationId = adapter.pushMutationsHistory[1]?.[0]
-			?.mutationId as string;
-		adapter.resolvePush({ acked: [secondMutationId] });
-		await Promise.all([p1, p2]);
-		assert.equal(collection.pending().length, 0);
-	});
-
-	it("protects against a stale push response after the record changed mid-flight (version-mismatch)", async () => {
-		const collection = makeCollection();
-		const id = collection.insert({ n: 1 }); // version 1, dirty
-		const adapter = createFakeSyncAdapter<Note>();
-		const engine = createSyncEngine({
-			collection,
-			adapter,
-			sleep: createInstantSleep(),
-		});
-
-		const pushPromise = engine.push();
-		const mutation = adapter.pushMutationsHistory[0]?.[0];
-		assert.equal(mutation?.record.meta.version, 1);
-
-		// The record is deleted locally WHILE the push is still in flight.
-		collection.delete(id);
-		assert.equal(collection.peek(id), undefined);
-		const versionAfterDelete = collection.pending().find((r) => r.id === id)
-			?.meta.version;
-		assert.equal(versionAfterDelete, 2);
-
-		// The (now-stale) server response arrives, acking the version-1 push and
-		// returning an authoritative version-1 record.
-		adapter.resolvePush({
-			acked: [mutation?.mutationId as string],
-			records: [
-				{
-					id,
-					data: { n: 1 },
-					meta: {
-						version: 1,
-						createdAt: 0,
-						updatedAt: 0,
-						deleted: false,
-						dirty: false,
-						source: "remote",
-					},
-				},
-			],
-		});
-		await pushPromise;
-
-		// The delete must NOT have been overwritten/resurrected, and must still be pending
-		// (the stale ack must not have cleared its dirty flag).
-		assert.equal(collection.peek(id), undefined);
-		const stillPending = collection.pending().find((r) => r.id === id);
-		assert.ok(stillPending, "the mid-flight delete must still be pending");
-		assert.equal(stillPending?.meta.version, 2);
-	});
-});
-
-describe("create-sync-engine: sync (push then pull)", () => {
-	it("calls push then pull, and emits sync:success", async () => {
-		const collection = makeCollection();
-		collection.insert({ n: 1 });
-		const adapter = createFakeSyncAdapter<Note>();
-		const engine = createSyncEngine({
-			collection,
-			adapter,
-			sleep: createInstantSleep(),
-		});
-
-		const events: string[] = [];
-		engine.on("sync:success", () => events.push("sync:success"));
-
-		const syncPromise = engine.sync();
-		const mutationId = adapter.pushMutationsHistory[0]?.[0]
-			?.mutationId as string;
-		adapter.resolvePush({ acked: [mutationId] });
-		await wait(10);
-		adapter.resolvePull({ records: [] });
-		await syncPromise;
-
-		assert.equal(adapter.pushCalls, 1);
-		assert.equal(adapter.pullCalls, 1);
-		assert.deepEqual(events, ["sync:success"]);
-	});
-
-	it("dedupes concurrent sync() calls into a single in-flight run, plus one more requested round", async () => {
-		const collection = makeCollection();
-		const adapter = createFakeSyncAdapter<Note>({ readOnly: true });
-		const engine = createSyncEngine({
-			collection,
-			adapter,
-			sleep: createInstantSleep(),
-		});
-
-		const p1 = engine.sync();
-		const p2 = engine.sync(); // arrives while p1 is in flight -> doesn't start a concurrent run...
-		await wait(5); // ...but sync() (unlike push()) has no "nothing changed" guard, so it
-		assert.equal(adapter.pullCalls, 1); // still hasn't started a second pull while the first is pending
-		adapter.resolvePull({ records: [] });
-
-		// ...schedules exactly one more full round after the first finishes, to cover
-		// whatever p2 was asking for.
-		await wait(5);
-		assert.equal(adapter.pullCalls, 2);
-		adapter.resolvePull({ records: [] });
-		await Promise.all([p1, p2]);
-	});
-});
-
-describe("create-sync-engine: retry/backoff", () => {
-	it("retries a failing pull via the injected sleep, then succeeds", async () => {
-		const collection = makeCollection();
-		let attempts = 0;
-		const sleepCalls: number[] = [];
-		const adapter: SyncAdapter<Note> = {
-			async pull() {
-				attempts += 1;
-				if (attempts < 3) throw new Error("flaky");
-				return { records: [] };
-			},
-		};
-		const engine = createSyncEngine({
-			collection,
-			adapter,
-			retry: { maxAttempts: 5, jitter: false, baseDelayMs: 1 },
-			sleep: async (ms) => {
-				sleepCalls.push(ms);
-			},
+describe("sync engine: pull", () => {
+	it("merges the remote's entries in; they aren't pending", async () => {
+		const { server, collection, engine } = await setup();
+		server.put({
+			format: "lww-1",
+			entries: { a: entry(1, 5), b: entry(null, 6) },
 		});
 		await engine.pull();
-		assert.equal(attempts, 3);
-		assert.equal(sleepCalls.length, 2);
+		assert.deepEqual(values(collection), { a: 1 });
+		assert.deepEqual(collection.pending(), []);
 	});
-});
 
-describe("create-sync-engine: offline gating", () => {
-	it("pull/push/sync no-op immediately when offline", async () => {
-		const collection = makeCollection();
-		collection.insert({ n: 1 });
-		const adapter = createFakeSyncAdapter<Note>();
-		const network = createFakeNetworkStatus(false);
+	it("keeps a local edit made after the remote's copy, and leaves it pending", async () => {
+		const { server, collection, engine } = await setup();
+		server.put({ format: "lww-1", entries: { a: entry(1, 5) } });
+		await engine.pull();
+		collection.upsert("a", { n: 2 });
+		await engine.pull();
+		assert.deepEqual(values(collection), { a: 2 });
+		assert.deepEqual(collection.pending(), ["a"]);
+	});
+
+	it("a stale read (from before a push landed) can't roll the saved value back", async () => {
+		const adapter = createFakeSyncAdapter<Item>();
+		const collection = await makeCollection();
 		const engine = createSyncEngine({
 			collection,
 			adapter,
-			network,
 			sleep: createInstantSleep(),
 		});
+		const pulling = engine.pull(); // reads the remote: it has a=1
+		await wait(1);
+		adapter.resolveRead({ entries: new Map([["a", entry(1, 5)]]) });
+		await pulling;
+		collection.upsert("a", { n: 2 });
+		const staleRead = engine.pull();
+		await wait(1);
+		// Meanwhile the edit is pushed elsewhere; this read still returns the old remote.
+		adapter.resolveRead({ entries: new Map([["a", entry(1, 5)]]) });
+		await staleRead;
+		assert.deepEqual(values(collection), { a: 2 });
+	});
+});
 
-		await engine.pull();
+describe("sync engine: push", () => {
+	it("writes the merge of the remote's entries and the local ones, keeping everyone's", async () => {
+		const { server, collection, engine } = await setup();
+		server.put({ format: "lww-1", entries: { theirs: entry(1, 5) } });
+		collection.upsert("mine", { n: 2 });
+		collection.delete("gone"); // no-op: never existed
+		await engine.push();
+		assert.deepEqual(Object.fromEntries(server.values()), {
+			theirs: { n: 1 },
+			mine: { n: 2 },
+		});
+		assert.deepEqual(values(collection), { theirs: 1, mine: 2 });
+		assert.deepEqual(collection.pending(), []);
+	});
+
+	it("pushes deletes as tombstones, so other devices learn of them", async () => {
+		const { server, collection, engine } = await setup();
+		collection.upsert("a", { n: 1 });
+		await engine.push();
+		collection.delete("a");
+		await engine.push();
+		assert.equal(server.entries.a?.deleted, true);
+		assert.equal(server.values().size, 0);
+	});
+
+	it("doesn't write when the remote already has everything", async () => {
+		const { server, collection, engine } = await setup();
+		collection.upsert("a", { n: 1 });
+		await engine.push();
+		const writes = server.writes;
 		await engine.push();
 		await engine.sync();
-		assert.equal(adapter.pullCalls, 0);
-		assert.equal(adapter.pushCalls, 0);
+		assert.equal(server.writes, writes);
 	});
 
-	it("reconnecting triggers an automatic sync when started", async () => {
-		const collection = makeCollection();
-		const adapter = createFakeSyncAdapter<Note>({ readOnly: true });
-		const network = createFakeNetworkStatus(false);
-		const engine = createSyncEngine({
-			collection,
-			adapter,
-			network,
-			sleep: createInstantSleep(),
-		});
-
-		engine.start({ syncOnStart: false });
-		assert.equal(adapter.pullCalls, 0);
-		network.set(true);
-		await wait(10);
-		assert.equal(adapter.pullCalls, 1);
-		adapter.resolvePull({ records: [] });
+	it("is a no-op for a read-only adapter", async () => {
+		const collection = await makeCollection();
+		const adapter: SyncAdapter<Item> = {
+			read: async () => ({ entries: new Map() }),
+		};
+		const engine = createSyncEngine({ collection, adapter });
+		collection.upsert("a", { n: 1 });
+		await engine.push();
+		assert.deepEqual(collection.pending(), ["a"]);
 	});
-});
 
-describe("create-sync-engine: pushOnChange", () => {
-	it("schedules a push automatically when the collection changes", async () => {
-		const collection = makeCollection();
-		const adapter = createFakeSyncAdapter<Note>();
+	it("an edit made while a push is in flight stays pending, and the next push saves it", async () => {
+		const adapter = createFakeSyncAdapter<Item>();
+		const collection = await makeCollection();
 		const engine = createSyncEngine({
 			collection,
 			adapter,
 			sleep: createInstantSleep(),
 		});
-
-		engine.start({ pushOnChange: true, syncOnStart: false });
-		collection.insert({ n: 1 });
-		await wait(10);
-		assert.equal(adapter.pushCalls, 1);
-		adapter.resolvePush({
-			acked: [adapter.pushMutationsHistory[0]?.[0]?.mutationId as string],
-		});
+		collection.upsert("a", { n: 1 });
+		const pushing = engine.push();
+		await wait(1);
+		adapter.resolveRead({ entries: new Map() });
+		await wait(1);
+		collection.upsert("a", { n: 2 }); // while the write is in flight
+		adapter.resolveWrite();
+		await pushing;
+		assert.deepEqual(collection.pending(), ["a"]);
+		assert.deepEqual(values(collection), { a: 2 });
+		const sent = adapter.writes[0]?.entries.get("a");
+		assert.deepEqual(sent?.value, { n: 1 });
 	});
 
-	it("does not push automatically when pushOnChange is not enabled", async () => {
-		const collection = makeCollection();
-		const adapter = createFakeSyncAdapter<Note>();
-		const engine = createSyncEngine({
-			collection,
-			adapter,
-			sleep: createInstantSleep(),
-		});
-
-		engine.start({ syncOnStart: false });
-		collection.insert({ n: 1 });
-		await wait(10);
-		assert.equal(adapter.pushCalls, 0);
-	});
-});
-
-describe("create-sync-engine: error handling asymmetry", () => {
-	it("a direct pull() call rejects and emits sync:error on failure", async () => {
-		const collection = makeCollection();
-		const adapter: SyncAdapter<Note> = {
-			pull: async () => {
-				throw new Error("boom");
+	it("a lost reply is harmless: the next push finds the write saved and needs none", async () => {
+		const server = createFakeBlobServer<Item>({ cas: true });
+		const blob = createBlobSyncAdapter(server);
+		let loseReply = true;
+		const adapter: SyncAdapter<Item> = {
+			read: () => blob.read(),
+			async write(entries, options) {
+				const result = await blob.write(entries, options);
+				if (loseReply) {
+					loseReply = false;
+					throw new Error("reply lost");
+				}
+				return result;
 			},
 		};
+		const collection = await makeCollection();
 		const engine = createSyncEngine({
 			collection,
 			adapter,
 			retry: { maxAttempts: 1 },
 			sleep: createInstantSleep(),
 		});
-		const errors: unknown[] = [];
-		engine.on("sync:error", (e) => errors.push(e));
-		await assert.rejects(() => engine.pull(), /boom/);
-		assert.equal(errors.length, 1);
+		collection.upsert("a", { n: 1 });
+		await assert.rejects(() => engine.push(), /reply lost/);
+		assert.deepEqual(collection.pending(), ["a"]); // not known to be saved
+		const writes = server.writes;
+		await engine.push();
+		assert.equal(server.writes, writes); // it was saved: nothing to write
+		assert.deepEqual(collection.pending(), []);
 	});
 
-	it("pushOnChange-triggered failures are swallowed (no unhandled rejection) but still emit sync:error", async () => {
-		const collection = makeCollection();
-		const adapter: SyncAdapter<Note> = {
-			pull: async () => ({ records: [] }),
-			push: async () => {
-				throw new Error("push failed");
-			},
-		};
-		const engine = createSyncEngine({
-			collection,
-			adapter,
-			retry: { maxAttempts: 1 },
-			sleep: createInstantSleep(),
-		});
-		const errors: unknown[] = [];
-		engine.on("sync:error", (e) => errors.push(e));
-		engine.start({ pushOnChange: true, syncOnStart: false });
-		collection.insert({ n: 1 });
-		await wait(20);
-		assert.equal(errors.length, 1); // the failure happened, but nothing threw to the caller
-	});
-});
-
-describe("create-sync-engine: start/stop/dispose lifecycle", () => {
-	it("start({ intervalMs }) runs sync periodically until stop()", async () => {
-		const collection = makeCollection();
-		let pullCalls = 0;
-		const adapter: SyncAdapter<Note> = {
-			pull: async () => {
-				pullCalls += 1;
-				return { records: [] };
-			},
-		};
-		const engine = createSyncEngine({
-			collection,
-			adapter,
-			sleep: createInstantSleep(),
-		});
-		engine.start({ intervalMs: 15, syncOnStart: false });
-		await wait(70);
-		engine.stop();
-		const countAtStop = pullCalls;
-		assert.ok(
-			countAtStop >= 2,
-			`expected several interval syncs, got ${countAtStop}`,
+	it("with etags, a concurrent write is merged and retried on top of it (nothing is erased)", async () => {
+		const { server, collection, engine } = await setup();
+		collection.upsert("mine", { n: 1 });
+		server.beforeNextWrite(() =>
+			server.put({ format: "lww-1", entries: { theirs: entry(2, 5) } }),
 		);
-		await wait(40);
-		assert.equal(pullCalls, countAtStop); // stopped -- no further calls
-	});
-
-	it("syncOnStart (default true) runs one sync immediately", async () => {
-		const collection = makeCollection();
-		const adapter = createFakeSyncAdapter<Note>({ readOnly: true });
-		const engine = createSyncEngine({
-			collection,
-			adapter,
-			sleep: createInstantSleep(),
-		});
-		engine.start(); // fires a fire-and-forget sync() -- give it a tick to reach pull()
-		await wait(5);
-		assert.equal(adapter.pullCalls, 1);
-		adapter.resolvePull({ records: [] });
-	});
-
-	it("dispose() makes pull/push/sync no-op", async () => {
-		const collection = makeCollection();
-		collection.insert({ n: 1 });
-		const adapter = createFakeSyncAdapter<Note>();
-		const engine = createSyncEngine({
-			collection,
-			adapter,
-			sleep: createInstantSleep(),
-		});
-		engine.dispose();
-		await engine.pull();
 		await engine.push();
+		assert.deepEqual(Object.fromEntries(server.values()), {
+			theirs: { n: 2 },
+			mine: { n: 1 },
+		});
+		assert.deepEqual(values(collection), { theirs: 2, mine: 1 });
+	});
+
+	it("gives up with an error if the remote keeps changing, and retries later", async () => {
+		const server = createFakeBlobServer<Item>({ cas: true });
+		const collection = await makeCollection();
+		const engine = createSyncEngine({
+			collection,
+			adapter: createBlobSyncAdapter(server),
+			retry: { maxAttempts: 1 },
+		});
+		collection.upsert("a", { n: 1 });
+		const keepChanging = (): void =>
+			server.beforeNextWrite(() => {
+				server.put({ format: "lww-1", entries: {} });
+				keepChanging();
+			});
+		keepChanging();
+		await assert.rejects(() => engine.push(), /kept conflicting/);
+		server.beforeNextWrite(() => {});
+		await engine.push();
+		assert.deepEqual(Object.fromEntries(server.values()), { a: { n: 1 } });
+	});
+
+	it("dedupes concurrent push() calls, plus one more pass for calls made meanwhile", async () => {
+		const adapter = createFakeSyncAdapter<Item>();
+		const collection = await makeCollection();
+		const engine = createSyncEngine({ collection, adapter });
+		collection.upsert("a", { n: 1 });
+		const first = engine.push();
+		const second = engine.push();
+		const third = engine.push();
+		await wait(1);
+		assert.equal(adapter.readCalls, 1);
+		adapter.resolveRead({ entries: new Map() });
+		await wait(1);
+		adapter.resolveWrite();
+		// The one queued pass finds nothing left to push, so it doesn't even read.
+		await Promise.all([first, second, third]);
+		assert.equal(adapter.readCalls, 1);
+		assert.equal(adapter.writes.length, 1);
+	});
+
+	it("pushes entries imported from an old format, which the remote doesn't hold yet", async () => {
+		const collection = await makeCollection();
+		const writes: Array<Map<string, Entry<Item>>> = [];
+		const adapter: SyncAdapter<Item> = {
+			read: async () => ({
+				entries: new Map(),
+				imported: new Map([["old", entry(7, 3, "legacy")]]),
+			}),
+			write: async (entries) => {
+				writes.push(new Map(entries));
+			},
+		};
+		const engine = createSyncEngine({ collection, adapter });
 		await engine.sync();
-		assert.equal(adapter.pullCalls, 0);
-		assert.equal(adapter.pushCalls, 0);
+		assert.deepEqual(values(collection), { old: 7 });
+		assert.deepEqual([...(writes[0]?.keys() ?? [])], ["old"]);
 	});
 });
 
-describe("create-sync-engine: events", () => {
-	it("emits sync:start, pull:success, and push:success with documented payload shapes", async () => {
-		const collection = makeCollection();
-		collection.insert({ n: 1 });
-		const adapter = createFakeSyncAdapter<Note>();
+describe("sync engine: sync()", () => {
+	it("pushes when there are changes, else pulls; emits sync:success", async () => {
+		const { server, collection, engine } = await setup();
+		const events: string[] = [];
+		engine.on("sync:start", ({ direction }) =>
+			events.push(`start:${direction}`),
+		);
+		engine.on("sync:success", () => events.push("success"));
+		await engine.sync();
+		collection.upsert("a", { n: 1 });
+		await engine.sync();
+		assert.deepEqual(events, [
+			"start:pull",
+			"success",
+			"start:push",
+			"success",
+		]);
+		assert.equal(server.values().size, 1);
+	});
+});
+
+describe("sync engine: retries, offline, and status", () => {
+	it("retries a failing read via the injected sleep, then succeeds", async () => {
+		let failures = 2;
+		const collection = await makeCollection();
+		const sleeps: number[] = [];
 		const engine = createSyncEngine({
 			collection,
-			adapter,
-			sleep: createInstantSleep(),
-		});
-
-		const starts: string[] = [];
-		let pullCount: number | undefined;
-		let pushCount: number | undefined;
-		engine.on("sync:start", ({ direction }) => starts.push(direction));
-		engine.on("pull:success", ({ count }) => {
-			pullCount = count;
-		});
-		engine.on("push:success", ({ count }) => {
-			pushCount = count;
-		});
-
-		const pushPromise = engine.push();
-		adapter.resolvePush({
-			acked: [adapter.pushMutationsHistory[0]?.[0]?.mutationId as string],
-		});
-		await pushPromise;
-
-		const pullPromise = engine.pull();
-		adapter.resolvePull({
-			records: [
-				{
-					id: "r1",
-					data: { n: 1 },
-					meta: {
-						version: 1,
-						createdAt: 0,
-						updatedAt: 0,
-						deleted: false,
-						dirty: false,
-						source: "remote",
-					},
+			adapter: {
+				read: async () => {
+					if (failures-- > 0) throw new Error("flaky");
+					return { entries: new Map([["a", entry(1, 5)]]) };
 				},
-			],
+			},
+			retry: { maxAttempts: 5, jitter: false, baseDelayMs: 100 },
+			sleep: async (ms) => {
+				sleeps.push(ms);
+			},
 		});
-		await pullPromise;
+		await engine.pull();
+		assert.deepEqual(sleeps, [100, 200]);
+		assert.deepEqual(values(collection), { a: 1 });
+	});
 
-		assert.deepEqual(starts, ["push", "pull"]);
-		assert.equal(pushCount, 1);
-		assert.equal(pullCount, 1);
+	it("pull/push/sync no-op when offline, and reconnecting syncs when started", async () => {
+		const network = createFakeNetworkStatus(false);
+		const server = createFakeBlobServer<Item>();
+		const collection = await makeCollection();
+		const engine = createSyncEngine({
+			collection,
+			adapter: createBlobSyncAdapter(server),
+			network,
+		});
+		collection.upsert("a", { n: 1 });
+		await engine.pull();
+		await engine.push();
+		await engine.sync();
+		assert.equal(server.writes, 0);
+		assert.equal(engine.getState().online, false);
+		engine.start({ syncOnStart: false });
+		network.set(true);
+		await wait();
+		assert.equal(server.writes, 1);
+		engine.dispose();
+	});
+
+	it("phase is 'error' after a failure (and stays so while retrying), then 'idle' after a success", async () => {
+		let fail = true;
+		const collection = await makeCollection();
+		const engine = createSyncEngine({
+			collection,
+			adapter: {
+				read: async () => {
+					if (fail) throw new Error("down");
+					return { entries: new Map() };
+				},
+			},
+			retry: { maxAttempts: 1 },
+		});
+		await assert.rejects(() => engine.pull(), /down/);
+		assert.equal(engine.getState().phase, "error");
+		assert.match(engine.getState().lastError ?? "", /down/);
+		const phases: string[] = [];
+		engine.status.subscribe((s) => phases.push(s.phase));
+		fail = false;
+		await engine.pull();
+		assert.equal(phases.includes("syncing"), false);
+		assert.equal(engine.getState().phase, "idle");
+		assert.equal(engine.getState().lastError, undefined);
+	});
+
+	it("a push failure is cleared once there's nothing left to push", async () => {
+		let fail = true;
+		const server = createFakeBlobServer<Item>();
+		const blob = createBlobSyncAdapter(server);
+		const collection = await makeCollection();
+		const engine = createSyncEngine({
+			collection,
+			adapter: {
+				read: () => blob.read(),
+				write: async (entries, options) => {
+					if (fail) throw new Error("write refused");
+					return blob.write(entries, options);
+				},
+			},
+			retry: { maxAttempts: 1 },
+		});
+		collection.upsert("a", { n: 1 });
+		await assert.rejects(() => engine.push(), /write refused/);
+		assert.equal(engine.getState().phase, "error");
+		// Someone else saved the same entry (e.g. another tab): nothing is left to push.
+		fail = false;
+		await blob.write(collection.snapshot(), {});
+		await engine.pull();
+		await engine.push();
+		assert.equal(engine.getState().phase, "idle");
+	});
+
+	it("counts pending changes, including ones loaded from storage", async () => {
+		const storage = createMemoryAdapter();
+		await storage.merge(
+			"items",
+			new Map([["a", { entry: entry(1, 5, "me") }]]),
+		);
+		const collection = await makeCollection(storage);
+		const engine = createSyncEngine({
+			collection,
+			adapter: createBlobSyncAdapter(createFakeBlobServer<Item>()),
+		});
+		await wait(1);
+		assert.equal(engine.getState().pending, 1);
+		collection.upsert("b", { n: 2 });
+		assert.equal(engine.getState().pending, 2);
+		await engine.push();
+		assert.equal(engine.getState().pending, 0);
+		assert.ok(engine.getState().lastSyncedAt !== undefined);
+	});
+
+	it("a pull after a failed load retries the load instead of failing forever", async () => {
+		const inner = createMemoryAdapter();
+		let failures = 1;
+		const collection = createCollection<Item>({
+			name: "items",
+			storage: {
+				...inner,
+				readAll: async (c) => {
+					if (failures-- > 0) throw new Error("disk unavailable");
+					return inner.readAll(c);
+				},
+			},
+			onError: () => {},
+		});
+		await collection.ready.catch(() => {});
+		const engine = createSyncEngine({
+			collection,
+			adapter: {
+				read: async () => ({ entries: new Map([["a", entry(1, 5)]]) }),
+			},
+		});
+		await engine.pull();
+		assert.equal(collection.hydrated, true);
+		assert.deepEqual(values(collection), { a: 1 });
+	});
+});
+
+describe("sync engine: automatic pushes", () => {
+	it("a burst of edits becomes one push after the debounce", async () => {
+		const { server, collection, engine } = await setup();
+		engine.start({ syncOnStart: false, pushOnChange: { debounceMs: 20 } });
+		collection.upsert("a", { n: 1 });
+		await wait(5);
+		collection.upsert("b", { n: 2 });
+		assert.equal(engine.getState().pushScheduled, true);
+		await wait(5);
+		assert.equal(server.writes, 0);
+		await wait(40);
+		assert.equal(server.writes, 1);
+		assert.equal(engine.getState().pushScheduled, false);
+		engine.dispose();
+	});
+
+	it("maxWaitMs bounds how long continuous edits can postpone a push", async () => {
+		const { server, collection, engine } = await setup();
+		engine.start({
+			syncOnStart: false,
+			pushOnChange: { debounceMs: 20, maxWaitMs: 40 },
+		});
+		for (let i = 0; i < 8; i++) {
+			collection.upsert("a", { n: i });
+			await wait(10);
+		}
+		assert.ok(server.writes >= 1);
+		engine.dispose();
+	});
+
+	it("remote data never schedules a push; edits from other tabs do", async () => {
+		const { collection, engine } = await setup();
+		engine.start({ syncOnStart: false, pushOnChange: { debounceMs: 0 } });
+		collection.mergeRemote(new Map([["a", entry(1, 5)]]), { synced: true });
+		assert.equal(engine.getState().pushScheduled, false);
+		collection.mergeFromTab(new Map([["b", { entry: entry(2, 6) }]]), []);
+		assert.equal(engine.getState().pushScheduled, true);
+		engine.dispose();
+	});
+
+	it("is off unless pushOnChange is set", async () => {
+		const { server, collection, engine } = await setup();
+		engine.start({ syncOnStart: false });
+		collection.upsert("a", { n: 1 });
+		await wait();
+		assert.equal(server.writes, 0);
+		engine.dispose();
+	});
+
+	it("flush() pushes a scheduled change immediately", async () => {
+		const { server, collection, engine } = await setup();
+		engine.start({ syncOnStart: false, pushOnChange: { debounceMs: 60_000 } });
+		collection.upsert("a", { n: 1 });
+		await engine.flush();
+		assert.equal(server.writes, 1);
+		engine.dispose();
+	});
+
+	it("background failures don't reject, but are reported via sync:error", async () => {
+		const collection = await makeCollection();
+		const engine = createSyncEngine({
+			collection,
+			adapter: {
+				read: async () => {
+					throw new Error("down");
+				},
+				write: async () => {},
+			},
+			retry: { maxAttempts: 1 },
+		});
+		const errors: unknown[] = [];
+		engine.on("sync:error", ({ error }) => errors.push(error));
+		engine.start({ syncOnStart: false, pushOnChange: { debounceMs: 0 } });
+		collection.upsert("a", { n: 1 });
+		await wait();
+		assert.equal(errors.length, 1);
+		engine.dispose();
+	});
+});
+
+describe("sync engine: lifecycle", () => {
+	it("start({ intervalMs }) syncs periodically until stop(); start() twice doesn't double it", async () => {
+		let reads = 0;
+		const collection = await makeCollection();
+		const engine = createSyncEngine({
+			collection,
+			adapter: {
+				read: async () => {
+					reads++;
+					return { entries: new Map() };
+				},
+			},
+		});
+		engine.start({ intervalMs: 10, syncOnStart: false });
+		engine.start({ intervalMs: 10, syncOnStart: false });
+		await wait(55);
+		engine.stop();
+		const counted = reads;
+		assert.ok(counted >= 3 && counted <= 6, `${counted} reads`);
+		await wait(30);
+		assert.equal(reads, counted);
+	});
+
+	it("syncOnStart (default) syncs once right away", async () => {
+		const { server, collection, engine } = await setup();
+		collection.upsert("a", { n: 1 });
+		engine.start();
+		await wait();
+		assert.equal(server.writes, 1);
+		engine.dispose();
+	});
+
+	it("calling start() again keeps a push that was already scheduled", async () => {
+		const { server, collection, engine } = await setup();
+		engine.start({ syncOnStart: false, pushOnChange: { debounceMs: 20 } });
+		collection.upsert("a", { n: 1 });
+		engine.start({ syncOnStart: false, pushOnChange: { debounceMs: 20 } });
+		await wait(50);
+		assert.equal(server.writes, 1);
+		engine.dispose();
+	});
+
+	it("dispose() makes pull/push/sync no-ops", async () => {
+		const { server, collection, engine } = await setup();
+		engine.dispose();
+		collection.upsert("a", { n: 1 });
+		await engine.pull();
+		await engine.push();
+		await engine.sync();
+		assert.equal(server.writes, 0);
+	});
+
+	it("waits for loading before syncing, so stored local edits are pushed, not overwritten", async () => {
+		const inner = createMemoryAdapter();
+		await inner.merge("items", new Map([["a", { entry: entry(9, 50, "me") }]]));
+		const gate = createDeferred<void>();
+		const collection = createCollection<Item>({
+			name: "items",
+			storage: {
+				...inner,
+				async readAll(c) {
+					await gate.promise;
+					return inner.readAll(c);
+				},
+			},
+		});
+		const server = createFakeBlobServer<Item>();
+		server.put({ format: "lww-1", entries: { a: entry(1, 10) } });
+		const engine = createSyncEngine({
+			collection,
+			adapter: createBlobSyncAdapter(server),
+		});
+		const syncing = engine.sync();
+		gate.resolve();
+		await syncing;
+		assert.deepEqual(server.values().get("a"), { n: 9 });
+	});
+});
+
+describe("sync engine: forgetting old deletes", () => {
+	const DAY = 24 * 60 * 60 * 1000;
+	const daysAgo = (days: number) => stampAt(Date.now() - days * DAY);
+
+	it("a push drops deletes older than 30 days from the remote, and keeps newer ones", async () => {
+		const { server, collection, engine } = await setup();
+		server.put({
+			format: "lww-1",
+			entries: {
+				old: { value: null, deleted: true, stamp: daysAgo(31), device: "x" },
+				recent: { value: null, deleted: true, stamp: daysAgo(29), device: "x" },
+			},
+		});
+		collection.upsert("a", { n: 1 }); // something to push
+		await engine.push();
+		assert.deepEqual(Object.keys(server.entries).sort(), ["a", "recent"]);
+		assert.deepEqual(collection.pending(), []);
+		assert.equal(collection.snapshot().has("old"), false); // forgotten here too
+	});
+
+	it("a device that was away removes a key whose delete was forgotten meanwhile", async () => {
+		const { server, collection, engine } = await setup();
+		// This device synced a value 40 days ago; since then it was deleted, and the delete
+		// was dropped after 30 days -- so the remote no longer has the key at all.
+		server.put({ format: "lww-1", entries: { k: entry(1, daysAgo(40)) } });
+		await engine.pull();
+		assert.deepEqual(values(collection), { k: 1 });
+		server.put({ format: "lww-1", entries: { other: entry(2, daysAgo(1)) } });
+		await engine.pull();
+		assert.deepEqual(values(collection), { other: 2 });
+		assert.equal(collection.snapshot().has("k"), false);
+	});
+
+	it("a remote that comes back empty (cleared, lost) deletes nothing; the next sync restores it", async () => {
+		const { server, collection, engine } = await setup();
+		server.put({
+			format: "lww-1",
+			entries: {
+				k: entry(1, daysAgo(40)),
+				gone: { value: null, deleted: true, stamp: daysAgo(31), device: "x" },
+			},
+		});
+		await engine.pull();
+		server.put({ format: "lww-1", entries: {} });
+		await engine.pull();
+		assert.deepEqual(values(collection), { k: 1 });
+		assert.deepEqual(collection.pending(), []); // nothing was edited...
+		await engine.sync(); // ...but the remote lacks data, so it's pushed back
+		assert.deepEqual(Object.keys(server.entries), ["k"]); // (the old delete is dropped)
+		assert.equal(collection.snapshot().has("gone"), false);
+		const writes = server.writes;
+		await engine.sync();
+		assert.equal(server.writes, writes); // and only once
+	});
+
+	it("keeps (and pushes) an unsaved edit, and a recent value a stale read hasn't seen", async () => {
+		const { server, collection, engine } = await setup();
+		server.put({ format: "lww-1", entries: { k: entry(1, daysAgo(40)) } });
+		await engine.pull();
+		collection.upsert("k", { n: 2 }); // edited here, not saved yet
+		collection.upsert("fresh", { n: 3 });
+		collection.mergeRemote(collection.snapshot(), { synced: true }); // as if just pushed
+		collection.upsert("k", { n: 4 });
+		server.put({ format: "lww-1", entries: {} }); // e.g. a read from before that push
+		await engine.pull();
+		assert.deepEqual(values(collection), { k: 4, fresh: 3 });
+		await engine.push();
+		// ("fresh" goes out again too: a push writes whatever the remote lacks.)
+		assert.deepEqual(Object.fromEntries(server.values()), {
+			k: { n: 4 },
+			fresh: { n: 3 },
+		});
+	});
+
+	it("an old delete that was never pushed is dropped too, without being written", async () => {
+		const storage = createMemoryAdapter();
+		await storage.merge(
+			"items",
+			new Map([
+				[
+					"k",
+					{
+						entry: {
+							value: null,
+							deleted: true,
+							stamp: daysAgo(45),
+							device: "me",
+						},
+					},
+				],
+			]),
+		);
+		const { server, collection, engine } = await setup({ storage });
+		collection.upsert("a", { n: 1 });
+		await engine.push();
+		await engine.pull();
+		assert.deepEqual(Object.keys(server.entries), ["a"]);
+		assert.equal(collection.snapshot().has("k"), false);
+		assert.deepEqual(collection.pending(), []);
 	});
 });

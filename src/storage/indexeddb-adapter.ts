@@ -1,35 +1,37 @@
 /**
- * ONE object store ("records") in IndexedDB, keyed by a composite `${collection}\0${id}`
- * record id with an index on `collection` for efficient collection reads. This lets collections
- * be created dynamically without needing to create a new object store for each one.
- * `readAll()` and `clear()` use the index.
+ * ONE object store ("records") in IndexedDB, keyed by a composite `${collection}\0${key}` id,
+ * with an index on `collection` for reading a whole collection. Collections can then be
+ * created dynamically, without a new object store (or a schema upgrade) for each.
+ *
+ * Entries are stored under the collection name `lww-1:<collection>`. Earlier versions of this
+ * library stored `{ record }` rows under the plain collection name, in this same schema
+ * (version 1). Those rows are left as they are -- an old tab still open keeps working, and
+ * nothing has to upgrade the database -- and `readLegacy` reads them for the import.
  *
  * The DB is opened lazily and memoized on first use, so construction is synchronous.
  * `close()` drops the handle; the next operation reopens.
  */
-import type { StorageAdapter, StoredRecord } from "./storage-adapter.js";
+import type { StorageAdapter, StoredEntry } from "./storage-adapter.js";
+import { mergeStored } from "./storage-adapter.js";
 
 const STORE = "records";
 const BY_COLLECTION = "by_collection";
-const SEPARATOR = "\u0000"; // null char, unlikely to appear in a collection name or id
+const SEPARATOR = "\u0000"; // null char, unlikely to appear in a collection name or key
+const NAMESPACE = "lww-1:";
 
-interface StoredEntry {
+interface Row {
 	key: string;
 	collection: string;
-	record: StoredRecord;
+	stored?: StoredEntry;
+	/** A row written by an earlier version of the library. */
+	record?: unknown;
 }
 
 export interface IndexedDBAdapterOptions {
 	/** Database name. Defaults to "app". */
 	databaseName?: string;
-	/** Database version. Defaults to 1. */
-	version?: number;
 	/** IndexedDB factory to use. Defaults to the global `indexedDB` (browser). */
 	indexedDB?: IDBFactory;
-}
-
-function compositeKey(collection: string, id: string): string {
-	return `${collection}${SEPARATOR}${id}`;
 }
 
 function promisifyRequest<T>(request: IDBRequest<T>): Promise<T> {
@@ -50,13 +52,9 @@ function transactionDone(tx: IDBTransaction): Promise<void> {
 	});
 }
 
-function openDatabase(
-	factory: IDBFactory,
-	name: string,
-	version: number,
-): Promise<IDBDatabase> {
+function openDatabase(factory: IDBFactory, name: string): Promise<IDBDatabase> {
 	return new Promise<IDBDatabase>((resolve, reject) => {
-		const request = factory.open(name, version);
+		const request = factory.open(name, 1);
 		request.onupgradeneeded = () => {
 			const db = request.result;
 			if (!db.objectStoreNames.contains(STORE)) {
@@ -76,89 +74,100 @@ export function createIndexedDBAdapter(
 	options: IndexedDBAdapterOptions = {},
 ): StorageAdapter {
 	const name = options.databaseName ?? "app";
-	const version = options.version ?? 1;
 	const factory = options.indexedDB ?? indexedDB;
 
 	let dbPromise: Promise<IDBDatabase> | undefined;
 	const getDb = (): Promise<IDBDatabase> => {
 		if (dbPromise === undefined) {
-			// A failed open must not be cached forever -- clear it so the next call retries.
-			dbPromise = openDatabase(factory, name, version).catch((err) => {
-				dbPromise = undefined;
-				throw err;
-			});
+			const opening = openDatabase(factory, name).then(
+				(db) => {
+					// Another tab (e.g. a newer deploy) needs to upgrade the schema: step aside
+					// rather than block it forever. The next operation here reopens.
+					db.onversionchange = () => {
+						db.close();
+						if (dbPromise === opening) dbPromise = undefined;
+					};
+					return db;
+				},
+				(err) => {
+					// A failed open must not be cached forever -- clear it so the next call retries.
+					if (dbPromise === opening) dbPromise = undefined;
+					throw err;
+				},
+			);
+			dbPromise = opening;
 		}
 		return dbPromise;
 	};
 
+	const rowsOf = async (collection: string): Promise<Row[]> => {
+		const db = await getDb();
+		const tx = db.transaction(STORE, "readonly");
+		const index = tx.objectStore(STORE).index(BY_COLLECTION);
+		const rows = await promisifyRequest<Row[]>(
+			index.getAll(IDBKeyRange.only(collection)),
+		);
+		await transactionDone(tx);
+		return rows;
+	};
+
+	const rowKey = (collection: string, key: string): string =>
+		`${NAMESPACE}${collection}${SEPARATOR}${key}`;
+
 	return {
-		async read(collection, id) {
-			const db = await getDb();
-			const tx = db.transaction(STORE, "readonly");
-			const request = tx.objectStore(STORE).get(compositeKey(collection, id));
-			const entry = await promisifyRequest<StoredEntry | undefined>(request);
-			await transactionDone(tx);
-			return entry?.record;
-		},
-
 		async readAll(collection) {
-			const db = await getDb();
-			const tx = db.transaction(STORE, "readonly");
-			const index = tx.objectStore(STORE).index(BY_COLLECTION);
-			const request = index.getAll(IDBKeyRange.only(collection));
-			const entries = await promisifyRequest<StoredEntry[]>(request);
-			await transactionDone(tx);
-			return entries.map((entry) => entry.record);
-		},
-
-		async write(collection, record) {
-			const db = await getDb();
-			const tx = db.transaction(STORE, "readwrite");
-			const store = tx.objectStore(STORE);
-			const entry: StoredEntry = {
-				key: compositeKey(collection, record.id),
-				collection,
-				record,
-			};
-			store.put(entry);
-			await transactionDone(tx);
-		},
-
-		async writeMany(collection, records) {
-			const db = await getDb();
-			const tx = db.transaction(STORE, "readwrite");
-			const store = tx.objectStore(STORE);
-			for (const record of records) {
-				const entry: StoredEntry = {
-					key: compositeKey(collection, record.id),
-					collection,
-					record,
-				};
-				store.put(entry);
+			const rows = await rowsOf(NAMESPACE + collection);
+			const prefix = rowKey(collection, "");
+			const result = new Map<string, StoredEntry>();
+			for (const row of rows) {
+				if (row.stored !== undefined)
+					result.set(row.key.slice(prefix.length), row.stored);
 			}
-			await transactionDone(tx);
+			return result;
 		},
 
-		async remove(collection, id) {
+		async merge(collection, changes) {
 			const db = await getDb();
+			// One readwrite transaction: no other tab can write these keys between the read
+			// and the write, so a newer entry stored meanwhile can't be overwritten.
 			const tx = db.transaction(STORE, "readwrite");
 			const store = tx.objectStore(STORE);
-			store.delete(compositeKey(collection, id));
-			await transactionDone(tx);
-		},
-
-		async clear(collection) {
-			const db = await getDb();
-			const tx = db.transaction(STORE, "readwrite");
-			const store = tx.objectStore(STORE);
-			const index = store.index(BY_COLLECTION);
-			const keys = await promisifyRequest<IDBValidKey[]>(
-				index.getAllKeys(IDBKeyRange.only(collection)),
+			const keys = [...changes.keys()];
+			const rows = await Promise.all(
+				keys.map((key) =>
+					promisifyRequest<Row | undefined>(store.get(rowKey(collection, key))),
+				),
 			);
-			for (const key of keys) {
-				store.delete(key);
-			}
+			const result = new Map<string, StoredEntry>();
+			keys.forEach((key, i) => {
+				const stored = mergeStored(
+					rows[i]?.stored,
+					changes.get(key) as StoredEntry,
+				);
+				result.set(key, stored);
+				const row: Row = {
+					key: rowKey(collection, key),
+					collection: NAMESPACE + collection,
+					stored,
+				};
+				store.put(row);
+			});
 			await transactionDone(tx);
+			return result;
+		},
+
+		async remove(collection, keys) {
+			if (keys.length === 0) return;
+			const db = await getDb();
+			const tx = db.transaction(STORE, "readwrite");
+			const store = tx.objectStore(STORE);
+			for (const key of keys) store.delete(rowKey(collection, key));
+			await transactionDone(tx);
+		},
+
+		async readLegacy(collection) {
+			const rows = await rowsOf(collection);
+			return rows.flatMap((row) => ("record" in row ? [row.record] : []));
 		},
 
 		async close() {

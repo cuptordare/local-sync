@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>localsync — read-only recipe (issues)</title>
+    <style>
+        :root {
+            color-scheme: light dark;
+            --bg: #f5f6fa;
+            --surface: #ffffff;
+            --border: #e2e4ec;
+            --text: #1c1f2a;
+            --muted: #6b7280;
+            --ok: #15803d;
+            --ok-bg: #e8f7ee;
+            --warn: #92610a;
+            --warn-bg: #fdf3e0;
+            --bad: #b91c1c;
+            --bad-bg: #fdecea;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #14151b;
+                --surface: #1b1d25;
+                --border: #2d303c;
+                --text: #e7e8ee;
+                --muted: #9aa0ac;
+                --ok: #4ade80;
+                --ok-bg: #12261a;
+                --warn: #fbbf24;
+                --warn-bg: #2b2109;
+                --bad: #f87171;
+                --bad-bg: #2c1616;
+            }
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            padding: 1.5rem 1rem 3rem;
+            font: 15px/1.5 system-ui, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+        }
+
+        main { max-width: 46rem; margin: 0 auto; display: grid; gap: 1rem; }
+        h1 { font-size: 1.4rem; margin: 0; }
+        .muted { color: var(--muted); font-size: 0.85em; }
+
+        section {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 0.65rem;
+            padding: 1rem;
+        }
+
+        input, select, button { font: inherit; color: inherit; }
+        input[type="search"], select {
+            padding: 0.4rem 0.6rem;
+            border: 1px solid var(--border);
+            border-radius: 0.4rem;
+            background: var(--bg);
+        }
+        button {
+            padding: 0.4rem 0.8rem;
+            border: 1px solid var(--border);
+            border-radius: 0.4rem;
+            background: var(--surface);
+            cursor: pointer;
+        }
+
+        .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+        .row input[type="search"] { flex: 1; min-width: 10rem; }
+
+        #list { list-style: none; margin: 0.75rem 0 0; padding: 0; }
+        #list li { padding: 0.45rem 0; border-bottom: 1px solid var(--border); }
+        #list .num { color: var(--muted); font-variant-numeric: tabular-nums; }
+        #list .labels { font-size: 0.8em; color: var(--muted); }
+
+        #status { padding: 0.6rem 1rem; }
+        #status[data-state="ok"] { background: var(--ok-bg); color: var(--ok); }
+        #status[data-state="busy"], #status[data-state="offline"] { background: var(--warn-bg); color: var(--warn); }
+        #status[data-state="error"] { background: var(--bad-bg); color: var(--bad); }
+
+        details summary { cursor: pointer; }
+        .demo label { display: block; margin: 0.3rem 0; }
+    </style>
+    <!-- No bundler. The browser loads localsync straight from the built dist/. -->
+    <script type="importmap">
+      {
+        "imports": {
+          "localsync": "../../dist/index.js"
+        }
+      }
+    </script>
+</head>
+
+<body>
+    <main>
+        <header>
+            <h1>Issues</h1>
+            <p class="muted">
+                Read-only recipe. Loads instantly from this device, refreshes in the background, and
+                keeps working offline.
+            </p>
+        </header>
+
+        <p id="loading">Loading…</p>
+
+        <div id="app" hidden>
+            <section id="status" data-state="ok" role="status"><span id="status-text"></span></section>
+
+            <section>
+                <div class="row">
+                    <select id="repo" aria-label="Repository">
+                        <option value="acme/web">acme/web</option>
+                        <option value="acme/api">acme/api</option>
+                    </select>
+                    <select id="state" aria-label="State">
+                        <option value="open">Open</option>
+                        <option value="closed">Closed</option>
+                        <option value="all">All</option>
+                    </select>
+                    <input id="search" type="search" placeholder="Search titles (locally)…" />
+                    <button id="refresh" type="button">Refresh</button>
+                </div>
+                <p id="count" class="muted"></p>
+                <ul id="list"></ul>
+            </section>
+
+            <section class="demo">
+                <details>
+                    <summary>Demo controls (simulate the outside world)</summary>
+                    <button id="activity" type="button">Simulate a change at the source</button>
+                    <label><input id="live" type="checkbox" /> Live activity (a change every 3s)</label>
+                    <label><input id="offline" type="checkbox" /> Go offline</label>
+                    <label><input id="fail" type="checkbox" /> Simulate API errors</label>
+                </details>
+            </section>
+        </div>
+    </main>
+
+    <script type="module" src="./main.js"></script>
+</body>
+
+</html>

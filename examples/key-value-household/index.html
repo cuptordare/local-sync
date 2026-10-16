@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>localsync — key-value recipe (household)</title>
+    <style>
+        :root {
+            color-scheme: light dark;
+            --bg: #f5f6fa;
+            --surface: #ffffff;
+            --border: #e2e4ec;
+            --text: #1c1f2a;
+            --muted: #6b7280;
+            --primary: #4f46e5;
+            --ok: #15803d;
+            --ok-bg: #e8f7ee;
+            --warn: #92610a;
+            --warn-bg: #fdf3e0;
+            --bad: #b91c1c;
+            --bad-bg: #fdecea;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #14151b;
+                --surface: #1b1d25;
+                --border: #2d303c;
+                --text: #e7e8ee;
+                --muted: #9aa0ac;
+                --primary: #818cf8;
+                --ok: #4ade80;
+                --ok-bg: #12261a;
+                --warn: #fbbf24;
+                --warn-bg: #2b2109;
+                --bad: #f87171;
+                --bad-bg: #2c1616;
+            }
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            padding: 1.5rem 1rem 3rem;
+            font: 15px/1.5 system-ui, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+        }
+
+        main { max-width: 40rem; margin: 0 auto; display: grid; gap: 1rem; }
+        h1 { font-size: 1.4rem; margin: 0; }
+        h2 { font-size: 1rem; margin: 0 0 0.5rem; }
+        .muted { color: var(--muted); font-size: 0.9em; }
+
+        section {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 0.65rem;
+            padding: 1rem;
+        }
+
+        input, select, button { font: inherit; color: inherit; }
+        input[type="text"], select {
+            padding: 0.4rem 0.6rem;
+            border: 1px solid var(--border);
+            border-radius: 0.4rem;
+            background: var(--bg);
+        }
+        button {
+            padding: 0.4rem 0.8rem;
+            border: 1px solid var(--border);
+            border-radius: 0.4rem;
+            background: var(--surface);
+            cursor: pointer;
+        }
+        button.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+
+        form { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+        form input[type="text"] { flex: 1; min-width: 10rem; }
+
+        #list { list-style: none; margin: 0.75rem 0 0; padding: 0; }
+        #list li {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 0.35rem 0; border-bottom: 1px solid var(--border);
+        }
+        #list li.done span { text-decoration: line-through; color: var(--muted); }
+        #list button { border: none; background: none; color: var(--muted); }
+
+        #status { display: flex; gap: 0.5rem; align-items: center; padding: 0.6rem 1rem; }
+        #status[data-state="saved"] { background: var(--ok-bg); color: var(--ok); }
+        #status[data-state="saving"] { background: var(--warn-bg); color: var(--warn); }
+        #status[data-state="offline"] { background: var(--warn-bg); color: var(--warn); }
+        #status[data-state="error"] { background: var(--bad-bg); color: var(--bad); }
+
+        #activity {
+            list-style: none; margin: 0.5rem 0 0; padding: 0; max-height: 14rem; overflow-y: auto;
+            font: 0.8rem/1.6 ui-monospace, monospace; color: var(--muted);
+        }
+        #activity li.bad { color: var(--bad); }
+
+        details summary { cursor: pointer; }
+        .demo label { display: block; margin: 0.3rem 0; }
+    </style>
+    <!-- No bundler. The browser loads localsync straight from the built dist/. -->
+    <script type="importmap">
+      {
+        "imports": {
+          "localsync": "../../dist/index.js"
+        }
+      }
+    </script>
+</head>
+
+<body>
+    <main>
+        <header>
+            <h1>Household</h1>
+            <p class="muted">
+                Key-value recipe. You're <strong id="device"></strong> --
+                <a id="other-device" href="?device=phone" target="_blank">open another device</a> to see changes sync.
+            </p>
+        </header>
+
+        <p id="loading">Loading…</p>
+
+        <div id="app" hidden>
+            <section id="status" data-state="saved" role="status">
+                <span id="status-text"></span>
+                <button id="retry" type="button" hidden>Retry</button>
+            </section>
+
+            <section>
+                <h2>Shopping list</h2>
+                <form id="add-form">
+                    <input id="new-item" type="text" placeholder="Add an item…" autocomplete="off" />
+                    <button class="primary" type="submit">Add</button>
+                </form>
+                <ul id="list"></ul>
+                <p id="empty" class="muted">Nothing to buy.</p>
+            </section>
+
+            <section>
+                <h2>Server activity (this device)</h2>
+                <p class="muted">
+                    Every request this device makes. Edits show instantly; the save follows about
+                    half a second after you stop. While you're idle nothing is sent, apart from a
+                    check for others' changes every 30 seconds and when you come back to the page.
+                </p>
+                <ul id="activity"></ul>
+                <p id="activity-empty" class="muted">No requests yet.</p>
+            </section>
+
+            <section class="demo">
+                <details>
+                    <summary>Demo controls</summary>
+                    <label><input id="offline" type="checkbox" /> Go offline</label>
+                    <label><input id="fail" type="checkbox" /> Simulate server errors</label>
+                    <button id="reset" type="button">Reset all demo data</button>
+                </details>
+            </section>
+        </div>
+    </main>
+
+
+    <script type="module" src="./main.js"></script>
+</body>
+
+</html>

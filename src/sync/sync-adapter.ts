@@ -1,56 +1,38 @@
 /**
- * The remote contract you implement.
- *
- * A `SyncAdapter` is the only thing standing between the local-first core and any
- * particular backend. Implement it and the sync engine can talk to your backend.
- *
- * Crucially, `push` is OPTIONAL. A read-only external source is a first-class adapter.
- * A normal CRUD backend implements BOTH `pull` and `push`. A read-only source implements
- * only `pull`.
- *
- * The adapter is responsible for MAPPING external API shapes into `RecordEnvelope`s
- * (stable id, a version, `source: "remote"`, etc.). That mapping is the per-backend glue;
- * the engine stays backend-agnostic.
+ * The remote contract: read the remote's entries, and write them back if nobody else wrote
+ * since that read. The sync engine does the rest -- it merges what it reads, and writes the
+ * merge of the remote's entries and its own -- so an adapter only moves data.
+ * `createBlobSyncAdapter` turns any "store one JSON document" backend into one.
  */
-import type { RecordEnvelope } from "../records/record-envelope.js";
+import type { Entries } from "../crdt/lww-map.js";
 
-export interface Mutation<T> {
-	/** Unique id for this push (lets the remote ack/deduplicate). */
-	mutationId: string;
-	collection: string;
-	recordId: string;
-	/** The local record to push (a tombstone, i.e. `meta.deleted`, represents a delete). */
-	record: RecordEnvelope<T>;
+export interface RemoteState<T> {
+	entries: Entries<T>;
+	/** An opaque version of what was read, for a compare-and-swap write (optional). */
+	etag?: string;
+	/**
+	 * Entries imported from an older format (see `createBlobSyncAdapter`'s `legacy`), which the
+	 * remote doesn't hold yet. They're merged in as local changes, so the next push saves them.
+	 */
+	imported?: Entries<T>;
 }
 
-export interface PullArgs<Filter, Cursor> {
-	/** Backend-specific filter (e.g. a JQL string, a repo + label set, etc.). */
-	filter?: Filter;
-	/** Opaque position from the previous pull, for incremental fetches. */
-	cursor?: Cursor;
+export interface WriteOptions {
+	/** The `etag` of the read this write is based on (only if the read returned one). */
+	ifMatch?: string;
 }
 
-export interface PullResult<T, Cursor> {
-	/** Records to merge locally. Map external data -> envelopes with `source: "remote"`. */
-	records: RecordEnvelope<T>[];
-	/** Cursor to pass to the next pull (e.g. a timestamp or page token). */
-	cursor?: Cursor;
-	/** Whether more pages remain right now. */
-	hasMore?: boolean;
-}
+/** Nothing (written), or `{ conflict: true }` when an `ifMatch` precondition failed. */
+// biome-ignore lint/suspicious/noConfusingVoidType: lets a plain `async () => { await ... }` writer type-check
+export type WriteResult = void | { conflict: true };
 
-export interface PushResult<T> {
-	/** `mutationId`s the remote accepted. */
-	acked: string[];
-	/** Authoritative server records to merge back (optional). */
-	records?: RecordEnvelope<T>[];
-	/** Mutations the remote rejected, with reasons (optional). */
-	rejected?: Array<{ mutationId: string; reason: string }>;
-}
-
-export interface SyncAdapter<T, Filter = unknown, Cursor = unknown> {
-	/** Fetch remote records (optionally filtered / incremental via cursor). */
-	pull(args: PullArgs<Filter, Cursor>): Promise<PullResult<T, Cursor>>;
-	/** Send local changes to the remote. OMIT for a read-only (pull-only) source. */
-	push?(mutations: Mutation<T>[]): Promise<PushResult<T>>;
+export interface SyncAdapter<T> {
+	/** Read every entry the remote holds. Throw on any failure. */
+	read(): Promise<RemoteState<T>>;
+	/**
+	 * Replace the remote's entries -- unless `ifMatch` is given and the remote changed since
+	 * (then return `{ conflict: true }`; the engine reads, merges and tries again). Throw on
+	 * any failure. Omit for a read-only remote.
+	 */
+	write?(entries: Entries<T>, options: WriteOptions): Promise<WriteResult>;
 }

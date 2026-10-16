@@ -1,144 +1,78 @@
-import { expect, test } from "@playwright/test";
+import { expect, type Page, test } from "@playwright/test";
 
-// BroadcastChannel is scoped to same-origin, same-profile browsing contexts -- two pages in
-// the SAME browser context are the closer analog to two real tabs of one browser than two
-// separate contexts (which Playwright otherwise isolates like separate browser profiles).
+// BroadcastChannel and Web Locks are scoped to one origin and browser profile -- two pages in
+// the SAME browser context are the closest analog to two real tabs of one browser.
 
-test("leader election converges to the same leader across two real pages", async ({
-	page,
-	context,
-}) => {
-	const channelName = `mt-election-${test.info().testId}`;
-
+async function openHarness(page: Page) {
 	await page.goto("/test/e2e/fixtures/harness.html");
 	await page.waitForFunction(() => window.__lsReady === true);
-	await page.evaluate((name) => {
-		window.__tab = window.__ls.createMultiTabSync({
-			channelName: name,
-			tabId: "page1",
-		});
-	}, channelName);
+}
 
-	const page2 = await context.newPage();
-	await page2.goto("/test/e2e/fixtures/harness.html");
-	await page2.waitForFunction(() => window.__lsReady === true);
-	await page2.evaluate((name) => {
-		window.__tab = window.__ls.createMultiTabSync({
-			channelName: name,
-			tabId: "page2",
-		});
-	}, channelName);
-
-	// Give the real BroadcastChannel announce/heartbeat round-trip a moment to settle.
-	await page.waitForFunction(
-		() => window.__tab.isLeader() === true,
-		undefined,
-		{ timeout: 5000 },
-	);
-	await page2.waitForFunction(
-		() => window.__tab.isLeader() === false,
-		undefined,
-		{ timeout: 5000 },
-	);
-
-	await page.evaluate(() => window.__tab.dispose());
-	await page2.evaluate(() => window.__tab.dispose());
-	await page2.close();
-});
-
-test("a real BroadcastChannel delivers app messages between two pages", async ({
+test("a real BroadcastChannel delivers messages between two pages", async ({
 	page,
 	context,
 }) => {
 	const channelName = `mt-broadcast-${test.info().testId}`;
-
-	await page.goto("/test/e2e/fixtures/harness.html");
-	await page.waitForFunction(() => window.__lsReady === true);
-	await page.evaluate((name) => {
-		window.__tab = window.__ls.createMultiTabSync({
-			channelName: name,
-			tabId: "sender",
-		});
-	}, channelName);
-
+	await openHarness(page);
 	const page2 = await context.newPage();
-	await page2.goto("/test/e2e/fixtures/harness.html");
-	await page2.waitForFunction(() => window.__lsReady === true);
+	await openHarness(page2);
 	await page2.evaluate((name) => {
 		window.__received = [];
-		window.__tab = window.__ls.createMultiTabSync({
-			channelName: name,
-			tabId: "receiver",
-		});
-		window.__tab.onBroadcast((message, fromTabId) =>
-			window.__received.push({ message, fromTabId }),
-		);
+		window.__channel = window.__ls.createBroadcastChannelTab(name);
+		window.__channel.subscribe((message) => window.__received.push(message));
 	}, channelName);
-
-	await page.evaluate(() => window.__tab.broadcast({ type: "hello", n: 1 }));
+	await page.evaluate((name) => {
+		window.__channel = window.__ls.createBroadcastChannelTab(name);
+		window.__channel.post({ type: "hello", entries: [["k", { n: 1 }]] });
+	}, channelName);
 	await page2.waitForFunction(() => window.__received.length >= 1);
-
-	const received = await page2.evaluate(() => window.__received);
-	expect(received).toEqual([
-		{ message: { type: "hello", n: 1 }, fromTabId: "sender" },
+	expect(await page2.evaluate(() => window.__received)).toEqual([
+		{ type: "hello", entries: [["k", { n: 1 }]] },
 	]);
-
-	await page.evaluate(() => window.__tab.dispose());
-	await page2.evaluate(() => window.__tab.dispose());
 	await page2.close();
 });
 
-test("closing the leader page's tab hands leadership to the follower", async ({
+/** An app on the shared database, with a remote that counts its reads. */
+async function openApp(page: Page, name: string) {
+	await openHarness(page);
+	await page.evaluate((databaseName) => {
+		window.__reads = 0;
+		window.__app = window.__ls.createLocalSyncApp({ name: databaseName });
+		window.__items = window.__app.keyValue<{ text: string }>("items", {
+			remote: {
+				read: async () => {
+					window.__reads++;
+					return { entries: new Map() };
+				},
+			},
+			syncIntervalMs: 50,
+		});
+		return window.__app.ready();
+	}, name);
+}
+
+test("tabs of one app share edits, and only the leader tab syncs", async ({
 	page,
 	context,
 }) => {
-	const channelName = `mt-handoff-${test.info().testId}`;
-
-	await page.goto("/test/e2e/fixtures/harness.html");
-	await page.waitForFunction(() => window.__lsReady === true);
-	await page.evaluate((name) => {
-		window.__tab = window.__ls.createMultiTabSync({
-			channelName: name,
-			tabId: "leader",
-		});
-	}, channelName);
-
+	const name = `mt-app-${test.info().testId}`;
+	await openApp(page, name);
 	const page2 = await context.newPage();
-	await page2.goto("/test/e2e/fixtures/harness.html");
-	await page2.waitForFunction(() => window.__lsReady === true);
-	await page2.evaluate((name) => {
-		window.__became = false;
-		window.__tab = window.__ls.createMultiTabSync({
-			channelName: name,
-			tabId: "follower",
-		});
-		window.__tab.onLeadershipChange((isLeader) => {
-			if (isLeader) window.__became = true;
-		});
-	}, channelName);
+	await openApp(page2, name);
 
-	await page.waitForFunction(
-		() => window.__tab.isLeader() === true,
-		undefined,
-		{ timeout: 5000 },
-	);
+	await page.evaluate(() => window.__items.set("k", { text: "from page 1" }));
 	await page2.waitForFunction(
-		() => window.__tab.isLeader() === false,
-		undefined,
-		{ timeout: 5000 },
+		() => window.__items.get("k")?.text === "from page 1",
 	);
 
-	// A clean dispose() sends an immediate "bye", so the follower should take over promptly.
-	await page.evaluate(() => window.__tab.dispose());
-	await page2.waitForFunction(() => window.__became === true, undefined, {
+	await page.waitForFunction(() => window.__reads >= 2); // page 1 leads: it polls
+	const followerReads = await page2.evaluate(() => window.__reads);
+	expect(followerReads).toBe(0);
+
+	// Closing the leader hands the Web Lock to page 2, which starts syncing right away.
+	await page.evaluate(() => window.__app.close());
+	await page2.waitForFunction(() => window.__reads >= 1, undefined, {
 		timeout: 5000,
 	});
-	await page2.waitForFunction(
-		() => window.__tab.isLeader() === true,
-		undefined,
-		{ timeout: 5000 },
-	);
-
-	await page2.evaluate(() => window.__tab.dispose());
 	await page2.close();
 });
