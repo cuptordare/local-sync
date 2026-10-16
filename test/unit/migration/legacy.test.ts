@@ -364,3 +364,43 @@ describe("migrating through the real Apps Script behavior", () => {
 		await Promise.all([d1.app.close(), d2.app.close()]);
 	});
 });
+
+describe("importing what this device stored, later on", () => {
+	it("doesn't import a record again once its key was deleted and the delete forgotten", async () => {
+		const DAY = 24 * 60 * 60 * 1000;
+		const storage = storageWithLegacy({
+			todo: [legacy("todo:x", ["old"], 1_700_000_500_000)],
+		});
+		const server = createFakeBlobServer<Todo>({ cas: true });
+		const open = (daysLater: number) => {
+			const app = createLocalSyncApp({
+				storage,
+				network: createFakeNetworkStatus(true),
+				onError: () => {},
+				now: () => Date.now() + daysLater * DAY,
+			});
+			const todo = app.keyValue<Todo>("todo", {
+				remote: createBlobSyncAdapter(server),
+				autoSync: false,
+			});
+			return { app, todo };
+		};
+		const first = open(0);
+		await first.app.ready();
+		await first.app.sync(); // imported, and pushed
+		first.todo.delete("todo:x");
+		await first.app.sync();
+		await first.app.close();
+		const later = open(40); // the delete has expired: forgotten here and on the remote
+		await later.app.ready();
+		later.todo.set("todo:y", { items: [] }); // something to push
+		await later.app.sync();
+		await later.app.close();
+		const reopened = open(40);
+		await reopened.app.ready();
+		await reopened.app.sync();
+		assert.equal(reopened.todo.get("todo:x"), undefined);
+		assert.equal(server.entries["todo:x"], undefined);
+		await reopened.app.close();
+	});
+});

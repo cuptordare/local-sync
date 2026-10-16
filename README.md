@@ -308,6 +308,25 @@ These all used to be things each app had to remember:
 | a save erasing another device's changes | merges per key on every save, with compare-and-swap |
 | writing merge code for edits made at the same time | merges them (fields, list items), the same on every device |
 
+## Limits
+
+Worth knowing before you pick it:
+
+- **Read-only sources re-fetch everything.** Each refresh downloads every page, which is
+  simple and always correct, and fine for hundreds or a few thousand items, but costly for
+  very large data sets. `fetchPage` must throw on any failure: an empty page empties the cache.
+- **A key-value store is one blob.** Every read and save moves the whole store: about 80
+  characters per key plus its value (deletes stay for 30 days). Mind your backend's limit,
+  e.g. a Google Sheets cell holds 50,000 characters. Split large data over several stores.
+- **The backend needs etags** (see [What your server must do](#recipe-2-key-value-data-you-read-and-write)).
+  Without them, two devices saving at the same moment can lose one save, silently.
+- **Merges are by field and by item, not by text.** Two edits of the same field (one note's
+  text, say) aren't combined: the later one wins. A list of strings, numbers or booleans is
+  merged as a set, so duplicates in it collapse into one. A list of objects is merged item by
+  item only if every item has a unique `id`; otherwise the later edit wins for the whole list.
+- **Deletes are kept for 30 days.** A device offline for longer, with an unsaved edit to a key
+  deleted meanwhile, brings that key back.
+
 ## Examples
 
 All three run with no build tooling, just a browser import map pointing at the built library:

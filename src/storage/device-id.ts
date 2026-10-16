@@ -6,8 +6,8 @@
  */
 import type { StorageAdapter } from "./storage-adapter.js";
 
-/** Where the id is kept: a reserved collection no app data uses. */
-const COLLECTION = "__localsync";
+/** Where the id is kept: a reserved collection no app data uses (the library's own notes). */
+export const COLLECTION = "__localsync";
 const KEY = "device";
 
 /** `length` random lowercase letters and digits. */

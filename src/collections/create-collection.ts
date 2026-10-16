@@ -44,7 +44,10 @@ import {
 	ValidationError,
 	validateOrThrow,
 } from "../records/record-validation.js";
-import { loadWriterId } from "../storage/device-id.js";
+import {
+	COLLECTION as LIBRARY_NOTES,
+	loadWriterId,
+} from "../storage/device-id.js";
 import type { StoredEntry } from "../storage/storage-adapter.js";
 import { deepEqual } from "../utils/deep-equal.js";
 import { deepFreeze } from "../utils/freeze.js";
@@ -349,18 +352,26 @@ export function createCollection<T extends object>(
 		if (loadAttempt !== undefined && !loadFailed) return loadAttempt;
 		loadFailed = false;
 		const attempt = (async () => {
-			const [stored, legacy, id] = await Promise.all([
+			const importing =
+				options.importLegacy !== false && storage.readLegacy !== undefined;
+			const [stored, legacy, notes, id] = await Promise.all([
 				storage.readAll(name),
-				options.importLegacy !== false && storage.readLegacy !== undefined
-					? storage.readLegacy(name)
-					: [],
+				importing ? (storage.readLegacy?.(name) ?? []) : [],
+				importing ? storage.readAll(LIBRARY_NOTES) : new Map(),
 				writerId(),
 			]);
 			// Records an older version stored on this device: import the ones newer than what's
-			// stored. The conversion is deterministic, so this is safe to repeat (and picks up
-			// writes an old tab still open made since).
+			// stored, and than any imported on an earlier load (so a key deleted since, and
+			// forgotten after its delete expired, isn't imported again). The conversion is
+			// deterministic, so this is safe to repeat, and picks up writes an old tab still
+			// open made since.
+			const marker = `legacy:${name}`;
+			const importedUpTo = notes.get(marker)?.entry.stamp ?? -1;
+			let newest = importedUpTo;
 			const imports = new Map<string, StoredEntry>();
 			for (const [key, entry] of fromLegacyRecords(legacy)) {
+				newest = Math.max(newest, entry.stamp);
+				if (entry.stamp <= importedUpTo) continue;
 				const current = stored.get(key)?.entry;
 				if (newerEntry(current, entry) !== current) imports.set(key, { entry });
 			}
@@ -368,6 +379,13 @@ export function createCollection<T extends object>(
 				for (const [key, merged] of await storage.merge(name, imports)) {
 					stored.set(key, merged);
 				}
+			}
+			if (newest > importedUpTo) {
+				const note = { value: {}, deleted: false, stamp: newest, device: "" };
+				await storage.merge(
+					LIBRARY_NOTES,
+					new Map([[marker, { entry: note }]]),
+				);
 			}
 			if (disposed) return;
 			writer = id;
