@@ -9,7 +9,8 @@
  * same way.
  *
  * Every write has its own `(stamp, device)` (each tab writes as its own device, and a clock
- * never repeats a stamp). The content tie-break below only keeps merge deterministic for
+ * never repeats a stamp; a merge of two edits takes the later edit's stamp, with `~<tab>`
+ * added to its device). The content tie-break below only keeps merge deterministic for
  * entries that break that rule (e.g. imported ones).
  */
 import type { Stamp } from "./hlc.js";
@@ -20,7 +21,7 @@ export interface Entry<T = unknown> {
 	value: T | null;
 	deleted: boolean;
 	stamp: Stamp;
-	/** The device (and tab) that wrote it. */
+	/** The device (and tab) that wrote it; for a merge, `<later edit's device>~<tab>`. */
 	device: string;
 }
 

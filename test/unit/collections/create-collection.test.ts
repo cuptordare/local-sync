@@ -348,6 +348,34 @@ describe("create-collection: sync integration", () => {
 		await notes.ready;
 		assert.equal(notes.peek("k")?.data.text, "early");
 	});
+
+	it("a merge is ordered right after its later edit, so a newer edit from another tab still wins", async () => {
+		const notes = makeCollection({ writerId: async () => "dev.t1" });
+		await notes.ready;
+		const base = entry("a", 100);
+		notes.mergeRemote(new Map([["k", base]]), { synced: true });
+		// Tab t2 (same device) edits; this tab is the one that syncs.
+		const edit: Entry<Note> = {
+			value: { text: "a", done: true },
+			deleted: false,
+			stamp: 200,
+			device: "dev.t2",
+		};
+		notes.mergeFromTab(new Map([["k", { entry: edit, base }]]), []);
+		// Someone else saved a change meanwhile: merged with t2's edit.
+		notes.mergeRemote(new Map([["k", entry("b", 150)]]), { synced: true });
+		assert.deepEqual(notes.peek("k")?.data, { text: "b", done: true });
+		assert.equal(notes.peek("k")?.meta.stamp, 200);
+		assert.equal(notes.peek("k")?.meta.device, "dev.t2~dev.t1");
+		// t2 made another edit before hearing of the merge: it's later, so it wins.
+		notes.mergeFromTab(
+			new Map([
+				["k", { entry: { ...edit, value: { text: "a" }, stamp: 201 } }],
+			]),
+			[],
+		);
+		assert.deepEqual(notes.peek("k")?.data, { text: "a" });
+	});
 });
 
 describe("create-collection: dispose", () => {

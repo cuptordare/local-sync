@@ -13,7 +13,7 @@ export interface RecordEnvelope<T> {
 export interface RecordMeta {
 	/** The write's hybrid-clock stamp (see crdt/hlc.ts). */
 	stamp: Stamp;
-	/** The device (and tab) that wrote it. */
+	/** The device (and tab) that wrote it; for a merge, `<later edit's device>~<tab>`. */
 	device: string;
 	/** Epoch ms of the write (from `stamp`). */
 	updatedAt: number;

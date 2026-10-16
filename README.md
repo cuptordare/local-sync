@@ -404,8 +404,10 @@ would replace the earlier one entirely, e.g. a phone that has shown the shopping
 hour saving it without the items someone added meanwhile. So each unsaved edit remembers the
 value it started from (its *base*), and when a device reads the remote (on a pull, or just
 before it saves) and finds that someone else saved the key since that base, it merges the
-three and saves the result as a new write. That write comes after both edits, so it wins on
-every device, and it contains both.
+three and saves the result as a new write. That write is ordered right after the later of the
+two edits (it takes that edit's stamp, and its `device` is that edit's with `~<this tab>`
+added), so it wins over both on every device, and it contains both, while an edit made after
+either of them (say in another tab, not yet heard of) still wins over it.
 
 The default merge, `mergeValues`:
 

@@ -67,7 +67,11 @@ interface Incoming<T> {
 
 /** Whether two writer ids are tabs of one device (see device-id.ts). */
 const sameDevice = (a: string, b: string): boolean =>
-	a.split(".")[0] === b.split(".")[0];
+	writerOf(a).split(".")[0] === writerOf(b).split(".")[0];
+
+/** The tab that wrote an entry: for a merge (`<edit's device>~<tab>`), the tab that merged. */
+const writerOf = (device: string): string =>
+	device.slice(device.lastIndexOf("~") + 1);
 
 export function createCollection<T extends object>(
 	options: CreateCollectionOptions<T>,
@@ -281,20 +285,31 @@ export function createCollection<T extends object>(
 	/**
 	 * Write values (null = delete) as new entries from this tab. Each edit's base is the entry
 	 * it replaces -- or, if that is itself an unsaved edit, that edit's base -- unless given.
+	 * A merge is ordered right after the later of its two edits (`after`), not at the time it
+	 * was made: so it beats both, but not an edit made after either of them (e.g. in another
+	 * tab, which this tab hasn't heard of yet).
 	 */
 	const commit = (
 		values: ReadonlyMap<string, T | null>,
-		givenBases?: ReadonlyMap<string, Entry<T>>,
+		merges?: {
+			bases: ReadonlyMap<string, Entry<T>>;
+			after: ReadonlyMap<string, Mark>;
+		},
 	): void => {
 		const incoming = new Map<string, Incoming<T>>();
 		for (const [key, value] of values) {
 			const current = entries.get(key);
-			const base = givenBases?.get(key) ?? baseFor(key, current);
+			const base = merges?.bases.get(key) ?? baseFor(key, current);
+			const after = merges?.after.get(key);
 			const entry: Entry<T> = deepFreeze({
 				value,
 				deleted: value === null,
-				stamp: clock.now(),
-				device: writer as string,
+				// The same stamp, and a device that sorts right after the edit's.
+				stamp: after?.stamp ?? clock.now(),
+				device:
+					after === undefined
+						? (writer as string)
+						: `${after.device}~${writer as string}`,
 			});
 			if (value !== null) {
 				// Already validated: read as is.
@@ -516,11 +531,15 @@ export function createCollection<T extends object>(
 		assertActive();
 		const incoming = new Map<string, Incoming<T>>();
 		const merged = new Map<string, T>();
+		const after = new Map<string, Mark>();
 		const rebased = new Map<string, Entry<T>>();
 		for (const [key, entry] of remote) {
 			if (opts.synced && hydrated) {
 				const combined = combine(key, entry, rebased);
-				if (combined !== undefined) merged.set(key, combined);
+				if (combined !== undefined) {
+					merged.set(key, combined);
+					after.set(key, newerEntry(entries.get(key), entry) as Entry<T>);
+				}
 			}
 			incoming.set(
 				key,
@@ -537,10 +556,12 @@ export function createCollection<T extends object>(
 		if (rebased.size > 0) schedulePersist();
 		// Each merge is a new write, built on what the remote holds now.
 		if (merged.size > 0)
-			commit(
-				merged,
-				new Map([...merged.keys()].map((k) => [k, remote.get(k) as Entry<T>])),
-			);
+			commit(merged, {
+				bases: new Map(
+					[...merged.keys()].map((k) => [k, remote.get(k) as Entry<T>]),
+				),
+				after,
+			});
 	};
 
 	const replaceAll = (values: ReadonlyMap<string, unknown>): void => {
